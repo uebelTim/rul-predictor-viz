@@ -96,12 +96,9 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
             params, _ = curve_fit(config['func'], time_norm, sensor_arr, p0=config['p0'], bounds=config['bounds'], maxfev=10000)
             preds = config['func'](time_norm, *params)
             
-            # --- NEW: Evaluation Window Slicing ---
             if eval_window is not None and eval_window < len(sensor_arr):
-                # Calculate MSE using ONLY the last 'n' points
                 mse = mean_squared_error(sensor_arr[-eval_window:], preds[-eval_window:])
             else:
-                # Calculate MSE over the entire lookback window
                 mse = mean_squared_error(sensor_arr, preds)
                 
             results[name] = {'params': params, 'mse': mse, 'func': config['func']}
@@ -462,27 +459,22 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
 # 4. Data Loading & Extraction Functions
 # ---------------------------------------------------------
 @st.cache_data
-def get_available_channels(path=r'data/alunorf_2_i-channels_ds.csv'):
-    try:
-        df = pd.read_csv(path, nrows=1)
-        cols = [col for col in df.columns if 'Error' not in col and col != 'DateTime']
-        if 'Thermo_Valve_Temperature_DeviationPct' in cols:
-            cols.remove('Thermo_Valve_Temperature_DeviationPct')
-        return [str(c) for c in cols]
-    except FileNotFoundError:
-        return ['32', '73', '15', '42']
+def get_available_channels(file_obj):
+    file_obj.seek(0) # Reset file pointer to the top
+    df = pd.read_csv(file_obj, nrows=1)
+    cols = [col for col in df.columns if 'Error' not in col and col != 'DateTime']
+    if 'Thermo_Valve_Temperature_DeviationPct' in cols:
+        cols.remove('Thermo_Valve_Temperature_DeviationPct')
+    return [str(c) for c in cols]
+
 
 @st.cache_data
-def load_my_sensor_data(col='32'):
+def load_my_sensor_data(file_obj, col='32'):
     freq = '4H'
     column_names=[]
-    path = r'data/alunorf_2_i-channels_ds.csv'
     
-    try:
-        df = pd.read_csv(path, parse_dates=['DateTime'])
-    except FileNotFoundError:
-        dates = pd.date_range(start='2024-01-01', periods=1000, freq='4H')
-        df = pd.DataFrame({'DateTime': dates, col: np.linspace(0.1, 0.9, 1000) + np.random.normal(0, 0.05, 1000)})
+    file_obj.seek(0) # Reset file pointer again before full load
+    df = pd.read_csv(file_obj, parse_dates=['DateTime'])
         
     df.set_index('DateTime', inplace=True)
     df = df[~df.index.duplicated(keep='first')]
@@ -523,9 +515,20 @@ def main():
     st.title("Predictive Maintenance: Dynamic RUL Engine")
 
     # --- UI SIDEBAR CONTROLS ---
+    st.sidebar.header("📁 Data Input")
+    
+    # 1. NEW: The File Uploader
+    uploaded_file = st.sidebar.file_uploader("Upload Sensor Data (CSV)", type=['csv'])
+
+    # Stop the app gracefully if no file is uploaded yet
+    if uploaded_file is None:
+        st.info("👋 Welcome! Please upload your sensor data CSV in the sidebar to begin.")
+        st.stop()
+
+    st.sidebar.markdown("---")
     st.sidebar.header("🛠️ Algorithm Parameters")
 
-    raw_channels = get_available_channels()
+    raw_channels = get_available_channels(uploaded_file)
     display_options = []
     for c in raw_channels:
         if c in ['32', '73']:
@@ -538,8 +541,7 @@ def main():
 
     window_size = st.sidebar.number_input("2. Window Size (Lookback)", min_value=10, max_value=5000, value=300, step=10)
 
-    # --- NEW: Evaluation Window Field ---
-    eval_window = st.sidebar.number_input("3. MSE Eval Window (Last N points)", min_value=1, max_value=window_size, value=min(100, window_size), step=1)
+    eval_window = st.sidebar.number_input("3. MSE Eval Window (Last N points)", min_value=1, max_value=window_size, value=min(50, window_size), step=1)
 
     st.sidebar.markdown("### 4. Model Override")
     override_model = st.sidebar.toggle("Enable Manual Selection", value=False)
@@ -556,7 +558,8 @@ def main():
 
     # --- END SIDEBAR ---
 
-    sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(col=selected_col)
+    # Load data using the newly uploaded file!
+    sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(uploaded_file, col=selected_col)
 
     max_index = len(time_arr) - 1
     thresholds = [0.2, 0.5, 1.0]
@@ -575,7 +578,7 @@ def main():
         top_models, all_models = evaluate_all_models(
             sliced_time, sliced_sensor, 
             priority_ranking=user_priority_dict, 
-            eval_window=eval_window,         # <--- Passes the new parameter to the master logic
+            eval_window=eval_window,         
             plot=False, verbose=False
         )
         
