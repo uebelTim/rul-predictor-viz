@@ -6,7 +6,47 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from streamlit_sortables import sort_items 
-import diagnostic_utils as du 
+#import diagnostic_utils as du 
+
+
+
+def filter_outliers_quantile(df, factor=1.5, keep_nans=True):
+    """
+    Filter out outliers from a DataFrame using the Interquartile Range (IQR) method.
+    'factor' is typically 1.5 for outliers and 3.0 for extreme outliers.
+    'keep_nans' if True, preserves original NaN positions after interpolation.
+    """
+    # Force numeric types
+    df_numeric = df.apply(pd.to_numeric, errors='coerce')
+
+    # Snapshot original NaN positions before any processing
+    original_nans = df_numeric.isna()
+
+    # Calculate quartiles and IQR
+    Q1 = df_numeric.quantile(0.25)
+    Q3 = df_numeric.quantile(0.75)
+    IQR = Q3 - Q1
+
+    # Define bounds
+    lower_bound = Q1 - (factor * IQR)
+    upper_bound = Q3 + (factor * IQR)
+
+    # Replace outliers with NaN
+    mask = (df_numeric >= lower_bound) & (df_numeric <= upper_bound)
+    df_filtered = df_numeric.where(mask, np.nan)
+
+    # Interpolate over outlier positions (not original NaNs)
+    df_filtered = df_filtered.interpolate(method='linear', limit_direction='both')
+
+    # Interpolate over axis=1 if still NaN values
+    if df_filtered.isnull().values.any():
+        df_filtered = df_filtered.interpolate(method='linear', axis=1, limit_direction='both')
+
+    # Restore original NaN positions
+    if keep_nans:
+        df_filtered[original_nans] = np.nan
+
+    return df_filtered
 
 # ---------------------------------------------------------
 # 1. The Standardized Mathematical Models (Pruned to 6)
