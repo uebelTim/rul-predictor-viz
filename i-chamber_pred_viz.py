@@ -510,7 +510,7 @@ def get_available_channels(file_obj):
 
 @st.cache_data
 def load_my_sensor_data(file_obj, col='32'):
-    freq = '4H'
+    freq = '4h'
     column_names=[]
     
     file_obj.seek(0) # Reset file pointer again before full load
