@@ -679,17 +679,17 @@ def main():
         
         # 3. Detect Structural Breaks on the history leading up to the current cutoff
         # 3. Detect Structural Breaks on the history leading up to the current cutoff
+        # 3. Detect Structural Breaks on the history leading up to the current cutoff
         history_time = time_arr[:cutoff_idx]
         history_sensor = sensor_arr_smooth[:cutoff_idx]
         
-        # Pass the new UI parameters into the detector
-        active_slope = global_slope if use_global_slope else None
+        # You can safely remove the 'global_slope' calculation as this method works purely on local velocity
         break_idx, break_time = detect_structural_break(
             history_time, 
             history_sensor, 
-            global_slope=active_slope,
-            slack_factor=cusum_slack,        # <-- Adjusted by UI
-            threshold_factor=cusum_threshold # <-- Adjusted by UI
+            window=break_window,
+            threshold_pct=slope_thresh,
+            sustained_points=break_sustained
         )
         
         # 4. Route the Curve Fitting
