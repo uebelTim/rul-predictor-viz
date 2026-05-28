@@ -143,58 +143,56 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
 
 
 # ---------------------------------------------------------
-# 3. Structural Break Detector (CUSUM)
+# 3. Structural Break Detector (Rolling Slope / Velocity)
 # ---------------------------------------------------------
-def detect_structural_break(time_arr, sensor_arr, global_slope=None, baseline_pct=0.20, slack_factor=0.5, threshold_factor=5.0):
+def detect_structural_break(time_arr, sensor_arr, window=21, threshold_pct=5.0, sustained_points=3):
     """
-    Detects a structural break using a Tabular CUSUM algorithm.
-    Includes a variance floor and blindfolds the training period to prevent hyper-sensitivity.
+    Detects a structural break by tracking the rolling linear slope (velocity) of the data.
+    Triggers when the upward slope is steep enough to cover 'threshold_pct' of the 
+    total data range within a standardized 30-day period, sustained over several days.
     """
     time_arr = np.asarray(time_arr, dtype=float)
     sensor_arr = np.asarray(sensor_arr, dtype=float)
     
-    if len(sensor_arr) < 10:
+    if len(sensor_arr) < window + sustained_points:
+        return None, None
+
+    # 1. Lightly smooth the max envelope to prevent single-day noise from warping the slope
+    smooth_sensor = pd.Series(sensor_arr).ewm(span=5, adjust=False).mean().values
+    
+    # 2. Determine the physical scale of the data
+    data_range = np.max(sensor_arr) - np.min(sensor_arr)
+    if data_range == 0:
         return None, None
         
-    n_base = max(5, int(len(sensor_arr) * baseline_pct))
-    t_base = time_arr[:n_base]
-    y_base = sensor_arr[:n_base]
+    # Calculate the absolute slope required to trigger a break.
+    # (e.g., slope needed to rise 5% of the total range over 30 days)
+    required_slope = (data_range * (threshold_pct / 100.0)) / 30.0
     
-    # Fit the baseline (Global Slope, Local Intercept OR Pure Local)
-    if global_slope is not None:
-        slope = global_slope
-        intercept = np.mean(y_base - slope * t_base) 
-    else:
-        slope, intercept = np.polyfit(t_base, y_base, 1)
-    
-    # Calculate residuals across the whole provided array
-    preds = slope * time_arr + intercept
-    residuals = sensor_arr - preds
-    
-    # Calculate baseline statistics
-    raw_base_std = np.std(residuals[:n_base])
-    
-    # FAILSAFE: The Variance Floor. 
-    # Ensure the standard deviation is never artificially tiny relative to the data's true scale.
-    data_range = np.max(sensor_arr) - np.min(sensor_arr)
-    min_allowable_std = data_range * 0.02 # Enforce a minimum 2% scale variance
-    
-    base_std = max(raw_base_std, min_allowable_std, 1e-5)
+    # 3. Calculate rolling slopes
+    slopes = np.zeros(len(smooth_sensor))
+    for i in range(window, len(smooth_sensor)):
+        t_win = time_arr[i-window : i]
+        y_win = smooth_sensor[i-window : i]
         
-    slack = slack_factor * base_std
-    threshold = threshold_factor * base_std
-    
-    # Tabular CUSUM
-    cusum = np.zeros(len(residuals))
+        # Calculate slope (m) for this window
+        m, _ = np.polyfit(t_win, y_win, 1)
+        slopes[i] = m
+
+    # 4. Find where the slope exceeds the threshold for 'sustained_points' consecutive days
+    consecutive_count = 0
     break_idx = None
     
-    # CRITICAL FIX: Only start looking for breaks AFTER the training baseline is over.
-    for i in range(n_base, len(residuals)):
-        cusum[i] = max(0, cusum[i-1] + residuals[i] - slack)
-        
-        if cusum[i] > threshold and break_idx is None:
-            break_idx = i
-            break 
+    # Start looking only after the first window has fully formed
+    for i in range(window, len(slopes)):
+        if slopes[i] >= required_slope:
+            consecutive_count += 1
+            if consecutive_count >= sustained_points:
+                # The actual break started 'sustained_points' ago when it first crossed
+                break_idx = i - sustained_points + 1
+                break
+        else:
+            consecutive_count = 0 # Reset if the slope dips back down
             
     if break_idx is not None:
         return break_idx, time_arr[break_idx]
@@ -652,13 +650,13 @@ def main():
     use_dynamic_variance = st.sidebar.toggle("Use Dynamic Variance (Linear Fit)", value=True, help="If off, uses a static variance (the last recorded standard deviation) across the entire future curve.")
 
     st.sidebar.markdown("### 7. Structural Break (CUSUM) Tuning")
-    use_global_slope = st.sidebar.toggle("Enforce Global Fleet Trend", value=False, help="If off, lets the specific sensor define its own 'healthy' baseline slope.")
+    break_window = st.sidebar.number_input("Rolling Window Size", min_value=7, max_value=90, value=21, step=1, help="Days to look back to calculate the current trend slope.")
     
     col_s, col_t = st.sidebar.columns(2)
     with col_s:
-        cusum_slack = st.number_input("Slack (Tolerance)", min_value=0.1, max_value=10.0, value=3.0, step=0.1, help="Higher = ignores larger daily spikes.")
+        slope_thresh = st.number_input("Severity Threshold (%)", min_value=0.5, max_value=50.0, value=5.0, step=0.5, help="Slope required to rise this % of total range in 30 days.")
     with col_t:
-        cusum_threshold = st.number_input("Alarm Threshold", min_value=1.0, max_value=500.0, value=30.0, step=1.0, help="Higher = requires more sustained damage before triggering.")
+        break_sustained = st.number_input("Sustained Days", min_value=1, max_value=14, value=3, step=1, help="Consecutive days the slope must stay high to trigger the break.")
     # 1. Load Data
     sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(uploaded_file, col=selected_col)
     
