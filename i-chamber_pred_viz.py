@@ -1,4 +1,4 @@
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, fsolve
 from sklearn.metrics import mean_squared_error
 import math
 import numpy as np
@@ -8,48 +8,33 @@ import streamlit as st
 from streamlit_sortables import sort_items 
 #import diagnostic_utils as du 
 
-
-
 def filter_outliers_quantile(df, factor=1.5, keep_nans=True):
     """
     Filter out outliers from a DataFrame using the Interquartile Range (IQR) method.
-    'factor' is typically 1.5 for outliers and 3.0 for extreme outliers.
-    'keep_nans' if True, preserves original NaN positions after interpolation.
     """
-    # Force numeric types
     df_numeric = df.apply(pd.to_numeric, errors='coerce')
-
-    # Snapshot original NaN positions before any processing
     original_nans = df_numeric.isna()
-
-    # Calculate quartiles and IQR
+    
     Q1 = df_numeric.quantile(0.25)
     Q3 = df_numeric.quantile(0.75)
     IQR = Q3 - Q1
-
-    # Define bounds
     lower_bound = Q1 - (factor * IQR)
     upper_bound = Q3 + (factor * IQR)
-
-    # Replace outliers with NaN
+    
     mask = (df_numeric >= lower_bound) & (df_numeric <= upper_bound)
     df_filtered = df_numeric.where(mask, np.nan)
-
-    # Interpolate over outlier positions (not original NaNs)
     df_filtered = df_filtered.interpolate(method='linear', limit_direction='both')
-
-    # Interpolate over axis=1 if still NaN values
+    
     if df_filtered.isnull().values.any():
         df_filtered = df_filtered.interpolate(method='linear', axis=1, limit_direction='both')
-
-    # Restore original NaN positions
+        
     if keep_nans:
         df_filtered[original_nans] = np.nan
-
+        
     return df_filtered
 
 # ---------------------------------------------------------
-# 1. The Standardized Mathematical Models (Pruned to 6)
+# 1. The Standardized Mathematical Models
 # ---------------------------------------------------------
 def arctan_model(t, L, k, t0, d):
     return L * (np.arctan(k * (t - t0)) / np.pi + 0.5) + d
@@ -82,7 +67,7 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
     sensor_arr = np.asarray(sensor_data)
     
     t_max = np.max(time_arr)
-    time_norm = time_arr / t_max
+    time_norm = time_arr / t_max if t_max > 0 else time_arr
     
     y_min = np.min(sensor_arr)
     y_max = np.max(sensor_arr)
@@ -160,7 +145,7 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
     return top_models_sorted, full_leaderboard
 
 # ---------------------------------------------------------
-# 3. Fitting and Envelope Generation Function
+# 3. Dynamic Variance & Dual Envelope RUL Plotting
 # ---------------------------------------------------------
 def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thresholds=None, 
                          input_time_unit="Hours", target_time_unit="Days", warm_start_params=None, 
@@ -211,83 +196,68 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     fitted_series = pd.Series(config['func'](time_norm, *params), index=orig_index, name=f"{model_choice}_Fit")
     residuals_series = pd.Series(sensor_raw - fitted_series, index=orig_index, name=f"{model_choice}_Residuals")
     
-    pos_residuals_series = residuals_series.where(residuals_series > 0, 0)
-    rolling_sigma_up = pos_residuals_series.rolling(window=20, min_periods=1).std()
-    
-    last_sigma = rolling_sigma_up.iloc[-1]
-    if pd.isna(last_sigma):
-        last_sigma = 0.0
-        
-    envelope_margin = last_sigma * sigma_factor
+    # ---------------------------------------------------------
+    # DYNAMIC VARIANCE CALCULATION
+    # ---------------------------------------------------------
+    # Calculate rolling STD on ALL residuals (assuming Gaussian spread)
+    rolling_std = residuals_series.rolling(window=20, min_periods=1).std()
+    rolling_std = rolling_std.bfill().fillna(0) 
+
+    # Linear Fit on the Rolling Standard Deviation
+    valid_mask = ~np.isnan(rolling_std)
+    if valid_mask.sum() > 1:
+        std_slope, std_intercept = np.polyfit(time_norm[valid_mask], rolling_std[valid_mask], 1)
+    else:
+        std_slope, std_intercept = 0.0, rolling_std.iloc[-1]
+
+    def get_dynamic_std(t_norm_val):
+        # Prevent variance from artificially dropping below zero
+        return np.maximum(0.0, std_slope * t_norm_val + std_intercept)
+
+    current_margin = get_dynamic_std(1.0) * sigma_factor
     cdf = 0.5 * (1.0 + math.erf(sigma_factor / math.sqrt(2)))
-    risk_pct = (1.0 - cdf) * 100
-    dynamic_risk_str = f"{risk_pct:.1f}%"
+    risk_pct_upper = (1.0 - cdf) * 100
+    risk_pct_lower = cdf * 100
 
-    flat_pct = 0.99
-    def solve_for_t(target_val):
-        f_time = None
-        t_flat = np.nan
-        c_max = np.nan
-        status = 'Unknown'
+    # ---------------------------------------------------------
+    # RUL ROOT FINDING (WITH ASYMPTOTE GATEKEEPER)
+    # ---------------------------------------------------------
+    def solve_for_dynamic_t(target_val, mode='nominal'):
+        """ mode: 'nominal', 'upper', 'lower' """
+        t_infinite = 10000.0 
+        ceiling_base = config['func'](t_infinite, *params)
+        
+        if mode == 'upper':
+            ceiling_val = ceiling_base + get_dynamic_std(t_infinite) * sigma_factor
+        elif mode == 'lower':
+            ceiling_val = ceiling_base - get_dynamic_std(t_infinite) * sigma_factor
+        else:
+            ceiling_val = ceiling_base
+
+        if ceiling_val < target_val:
+            return 'Safe' 
+
+        def target_equation(t_guess):
+            base_val = config['func'](t_guess, *params)
+            if mode == 'upper':
+                return (base_val + get_dynamic_std(t_guess) * sigma_factor) - target_val
+            elif mode == 'lower':
+                return (base_val - get_dynamic_std(t_guess) * sigma_factor) - target_val
+            else:
+                return base_val - target_val
+
+        t_guess_initial = 1.0 
         try:
-            if model_choice == 'Rational':
-                a, b, d = params
-                c_max = a + d
-                if target_val < c_max:
-                    f_time = ((b * (target_val - d)) / (a - (target_val - d))) * t_max
-                else:
-                    t_flat = (((flat_pct * b) / (1 - flat_pct)) * t_max)
-            elif model_choice == 'Arctangent':
-                L, k, t0, d = params
-                c_max = L + d
-                if target_val < c_max:
-                    inner_val = np.pi * (((target_val - d) / L) - 0.5)
-                    f_time = (t0 + (1 / k) * np.tan(inner_val)) * t_max
-                else:
-                    t_flat = ((t0 + (1 / k) * np.tan(0.49 * np.pi)) * t_max)
-            elif model_choice == 'Linear':
-                m, c = params
-                if m != 0:
-                    f_time = (target_val - c) / m
-                else:
-                    status = 'Flat Line (No Failure)' if c < target_val else 'Flat Line (Already Failed)'
-                    c_max = c
-            elif model_choice == 'Gompertz':
-                a, b, c, d = params
-                c_max = a + d
-                if target_val < c_max:
-                    inner_log = -np.log((target_val - d) / a) / b
-                    if inner_log > 0:
-                        f_time = (-np.log(inner_log) / c) * t_max
-                else:
-                    t_flat = ((-np.log(-np.log(flat_pct) / b) / c) * t_max)
-                    
-            elif model_choice == 'Softplus':
-                a, b, t0, d = params
-                if target_val > d and a > 0 and b > 0:
-                    inner_exp = np.exp((target_val - d) / a) - 1
-                    if inner_exp > 0:
-                        f_time = (t0 + np.log(inner_exp) / b) * t_max
-                    else:
-                        status = 'Math Error'
-                else:
-                    status = 'Flat Line (No Failure)'
-                    
-            elif model_choice == 'Shifted Exponential':
-                a, b, t0, d = params
-                if target_val > d and a > 0 and b > 0:
-                    inner_val = (target_val - d) / a
-                    if inner_val > 0:
-                        f_time = (t0 + np.log(inner_val) / b) * t_max
-                    else:
-                        status = 'Math Error'
-                else:
-                    status = 'Flat Line (No Failure)'
+            t_solution = fsolve(target_equation, t_guess_initial)[0]
+            if abs(target_equation(t_solution)) > 1e-3 or t_solution < 0:
+                return None 
+            return t_solution * t_max
         except Exception:
-            status = 'Math Error'
-            
-        return f_time, t_flat, c_max, status
+            return None
 
+    # ---------------------------------------------------------
+    # RECORD GENERATION
+    # ---------------------------------------------------------
     rul_records = []
     plot_end_time_raw = raw_current_time * 1.2 
     
@@ -296,169 +266,154 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
             thresholds = [thresholds]
             
         for thresh in sorted(thresholds):
-            nom_time, t_flat, c_max, nom_err = solve_for_t(thresh)
-            cons_time, _, _, cons_err = solve_for_t(thresh - envelope_margin)
+            nom_time = solve_for_dynamic_t(thresh, mode='nominal')
+            upper_time = solve_for_dynamic_t(thresh, mode='upper') 
+            lower_time = solve_for_dynamic_t(thresh, mode='lower') 
             
-            record = {
-                'Threshold': thresh,
-                'Status': 'Unknown',
-                'Envelope_Margin': envelope_margin,
-                'Nominal_RUL': np.nan,
-                'Nominal_Abs_Time': np.nan,
-                'Conservative_RUL': np.nan,
-                'Conservative_Abs_Time': np.nan,
-                'Ceiling_Max': c_max,
-                'Time_to_Flatten': (t_flat * conversion_factor) if not np.isnan(t_flat) else np.nan
-            }
-            
-            if nom_time is not None:
-                record['Nominal_Abs_Time'] = nom_time * conversion_factor
-                record['Nominal_RUL'] = (nom_time - raw_current_time) * conversion_factor
-                plot_end_time_raw = max(plot_end_time_raw, nom_time * 1.1)
-            
-            if cons_time is not None:
-                record['Conservative_Abs_Time'] = cons_time * conversion_factor
-                record['Conservative_RUL'] = (cons_time - raw_current_time) * conversion_factor
-                plot_end_time_raw = max(plot_end_time_raw, cons_time * 1.1)
-            
-            n_rul = record['Nominal_RUL']
-            c_rul = record['Conservative_RUL']
-            
-            if not np.isnan(n_rul):
-                if n_rul < 0:
-                    record['Status'] = 'Already Reached'
-                else:
-                    if not np.isnan(c_rul) and c_rul < 0:
-                        record['Status'] = 'Envelope Breached'
-                    else:
-                        record['Status'] = 'Predicted Future'
+            # Convert to numeric RULs or NaN
+            def calc_rul(t_val):
+                return (t_val - raw_current_time) * conversion_factor if isinstance(t_val, float) else np.nan
+            def calc_abs(t_val):
+                return t_val * conversion_factor if isinstance(t_val, float) else np.nan
+
+            nom_rul, upper_rul, lower_rul = calc_rul(nom_time), calc_rul(upper_time), calc_rul(lower_time)
+            nom_abs, upper_abs, lower_abs = calc_abs(nom_time), calc_abs(upper_time), calc_abs(lower_time)
+
+            # Determine Status
+            if nom_time == 'Safe':
+                status = 'Never Reached (Safe)'
+            elif not np.isnan(nom_rul) and nom_rul < 0:
+                status = 'Already Reached'
+            elif not np.isnan(upper_rul) and upper_rul < 0:
+                status = 'Envelope Breached'
             else:
-                if not np.isnan(c_rul):
-                    if c_rul < 0:
-                        record['Status'] = 'Envelope Breached'
-                    else:
-                        record['Status'] = 'Envelope Risk (Future)'
-                elif nom_err != 'Unknown' and nom_err != 'Math Error':
-                    record['Status'] = nom_err
-                else:
-                    record['Status'] = 'Never Reached (Safe)'
-                    if not np.isnan(record['Time_to_Flatten']):
-                        plot_end_time_raw = max(plot_end_time_raw, (record['Time_to_Flatten'] / conversion_factor) * 1.1)
+                status = 'Predicted Future'
             
-            rul_records.append(record)
+            # Extend plot boundary to the furthest RUL
+            valid_times = [t for t in [nom_abs, upper_abs, lower_abs] if not np.isnan(t)]
+            if valid_times:
+                plot_end_time_raw = max(plot_end_time_raw, max(valid_times) / conversion_factor * 1.1)
+
+            rul_records.append({
+                'Threshold': thresh,
+                'Status': status,
+                'Current_Margin': current_margin,
+                'Nominal_RUL': nom_rul, 'Nominal_Abs_Time': nom_abs,
+                'Upper_Band_RUL': upper_rul, 'Upper_Abs_Time': upper_abs,
+                'Lower_Band_RUL': lower_rul, 'Lower_Abs_Time': lower_abs
+            })
 
     rul_df = pd.DataFrame(rul_records)
             
+    # ---------------------------------------------------------
+    # PLOTTING
+    # ---------------------------------------------------------
     time_arr_converted = time_arr * conversion_factor
     plot_end_time_converted = plot_end_time_raw * conversion_factor
     current_time_converted = raw_current_time * conversion_factor
     max_zoom_limit = current_time_converted * 2.5
     final_end_time = min(plot_end_time_converted, max_zoom_limit)
     
+    # Smooth arrays for the future curves
     time_smooth_converted = np.linspace(0, final_end_time, 500)
     time_smooth_norm = (time_smooth_converted / conversion_factor) / t_max
+    
     smooth_preds = config['func'](time_smooth_norm, *params)
+    dynamic_std_smooth = get_dynamic_std(time_smooth_norm)
+    
+    upper_env_smooth = smooth_preds + (dynamic_std_smooth * sigma_factor)
+    lower_env_smooth = smooth_preds - (dynamic_std_smooth * sigma_factor)
     
     fig = go.Figure()
 
+    # Scatter: Original Data (Max Envelope)
     fig.add_trace(go.Scatter(
-        x=time_arr_converted, y=sensor_arr, mode='markers', name='Actual Data',
+        x=time_arr_converted, y=sensor_raw, mode='markers', name='Max Envelope Data',
         marker=dict(color='gray', size=5, opacity=0.7)
     ))
 
-    hist_envelope = fitted_series + (rolling_sigma_up * sigma_factor)
-    fig.add_trace(go.Scatter(
-        x=time_arr_converted, y=fitted_series, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'
-    ))
-    fig.add_trace(go.Scatter(
-        x=time_arr_converted, y=hist_envelope, mode='lines', line=dict(width=0),
-        fill='tonexty', fillcolor='rgba(0, 0, 255, 0.15)', name='Historical Variance'
-    ))
-
+    # Main Fit Line
     fig.add_trace(go.Scatter(
         x=time_smooth_converted, y=smooth_preds, mode='lines', name=f'{model_choice} Fit',
         line=dict(color='blue', width=2.5), opacity=0.8
     ))
 
+    # Lower Envelope Band (Invisible line, used for fill boundary)
     fig.add_trace(go.Scatter(
-        x=time_smooth_converted, y=smooth_preds + envelope_margin, mode='lines', name='Projected Upper Env.',
+        x=time_smooth_converted, y=lower_env_smooth, mode='lines', 
+        line=dict(width=0), showlegend=False, hoverinfo='skip'
+    ))
+
+    # Upper Envelope Band (Fills down to the lower envelope)
+    fig.add_trace(go.Scatter(
+        x=time_smooth_converted, y=upper_env_smooth, mode='lines', 
+        line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 0, 255, 0.15)', 
+        name=f'±{sigma_factor}σ Confidence Band'
+    ))
+
+    # Projected dashed lines for boundaries
+    fig.add_trace(go.Scatter(
+        x=time_smooth_converted, y=upper_env_smooth, mode='lines', name=f'Upper Threshold ({risk_pct_upper:.1f}% Risk)',
         line=dict(color='blue', width=1.5, dash='dashdot'), opacity=0.6
     ))
+    fig.add_trace(go.Scatter(
+        x=time_smooth_converted, y=lower_env_smooth, mode='lines', name=f'Lower Threshold ({risk_pct_lower:.1f}% Risk)',
+        line=dict(color='blue', width=1.5, dash='dot'), opacity=0.4
+    ))
     
+    # ---------------------------------------------------------
+    # ANNOTATIONS & DYNAMIC TITLES
+    # ---------------------------------------------------------
     unit_short = {"Seconds": "s", "Minutes": "m", "Hours": "h", "Days": "d"}.get(target_time_unit, target_time_unit)
     colors = ['#FFA500', '#FF0000', '#8B0000', '#800080', '#000000']
     status_lines = []
     
-    def format_rul(val, unit, max_val):
-        if pd.isna(val) or math.isinf(val): 
-            return "Safe"
-        if val > max_val:
-            return f"> {max_val}{unit}"
-        return f"{val:.1f}{unit}"
+    def format_rul(val):
+        if pd.isna(val): return "Safe"
+        if val > max_rul_display: return f"> {max_rul_display}{unit_short}"
+        if val < 0: return f"Breached"
+        return f"{val:.1f}{unit_short}"
 
     if not rul_df.empty:
         for idx, row in rul_df.iterrows():
             c = colors[idx % len(colors)]
             thresh = float(row['Threshold'])
             status = row['Status']
-            status_lines.append(f"T={thresh:.2f}: {status}")
             
-            if status in ['Predicted Future', 'Envelope Breached', 'Envelope Risk (Future)']:
-                n_rul = row['Nominal_RUL']
-                c_rul = row['Conservative_RUL']
-                n_time = row['Nominal_Abs_Time']
-                c_time = row['Conservative_Abs_Time']
-                
-                n_str = format_rul(n_rul, unit_short, max_rul_display)
-                c_str = format_rul(c_rul, unit_short, max_rul_display)
-                
-                lbl = f"T={thresh:.2f} (Trend: {n_str} | {dynamic_risk_str}: {c_str})"
-                    
+            n_str = format_rul(row['Nominal_RUL'])
+            u_str = format_rul(row['Upper_Band_RUL'])
+            l_str = format_rul(row['Lower_Band_RUL'])
+            
+            # Format the subtitle string perfectly for UI
+            if status == 'Never Reached (Safe)':
+                status_lines.append(f"<b>T={thresh:.2f}:</b> {status}")
+            else:
+                status_lines.append(f"<b>T={thresh:.2f} RUL</b> &rarr; <b>Nominal:</b> {n_str} | <b>Upper Risk (Earliest):</b> {u_str} | <b>Lower Risk (Latest):</b> {l_str}")
+            
+            # Draw the horizontal threshold line
+            fig.add_trace(go.Scatter(
+                x=[0, final_end_time], y=[thresh, thresh], mode='lines', name=f"Threshold {thresh}",
+                line=dict(color=c, width=2, dash='dash'), opacity=0.6
+            ))
+            
+            # Plot the specific crossing points if they exist within the timeline
+            if not pd.isna(row['Nominal_Abs_Time']) and row['Nominal_Abs_Time'] <= final_end_time:
                 fig.add_trace(go.Scatter(
-                    x=[0, final_end_time], y=[thresh, thresh], mode='lines', name=lbl,
-                    line=dict(color=c, width=2, dash='dash'), opacity=0.6
+                    x=[row['Nominal_Abs_Time']], y=[thresh], mode='markers', showlegend=False,
+                    marker=dict(symbol='circle', color=c, size=10, line=dict(color='black', width=1))
                 ))
-                
-                if not pd.isna(n_time) and n_time <= final_end_time:
-                    fig.add_trace(go.Scatter(
-                        x=[n_time], y=[thresh], mode='markers', showlegend=False,
-                        marker=dict(symbol='circle', color=c, size=10, line=dict(color='black', width=1)),
-                        hoverinfo='skip'
-                    ))
-                    fig.add_vline(x=n_time, line_dash="dot", line_color=c, opacity=0.3)
-                
-                if not pd.isna(c_time) and c_time <= final_end_time:
-                    fig.add_trace(go.Scatter(
-                        x=[c_time], y=[thresh], mode='markers', showlegend=False,
-                        marker=dict(symbol='x', color=c, size=12, line=dict(color='black', width=1)),
-                        hoverinfo='skip'
-                    ))
-                    fig.add_vline(x=c_time, line_dash="dashdot", line_color=c, opacity=0.3)
-                    
-            elif status == 'Already Reached':
+            if not pd.isna(row['Upper_Abs_Time']) and row['Upper_Abs_Time'] <= final_end_time:
                 fig.add_trace(go.Scatter(
-                    x=[0, final_end_time], y=[thresh, thresh], mode='lines', name=f"T={thresh:.2f} (Breached)",
-                    line=dict(color=c, width=2, dash='dash'), opacity=0.6
+                    x=[row['Upper_Abs_Time']], y=[thresh], mode='markers', showlegend=False,
+                    marker=dict(symbol='triangle-left', color=c, size=10, line=dict(color='black', width=1))
                 ))
-                if not pd.isna(row['Nominal_Abs_Time']) and row['Nominal_Abs_Time'] <= final_end_time:
-                    fig.add_trace(go.Scatter(
-                        x=[row['Nominal_Abs_Time']], y=[thresh], mode='markers', showlegend=False,
-                        marker=dict(symbol='circle', color=c, size=10, line=dict(color='black', width=1))
-                    ))
-                    
-            elif status == 'Never Reached (Safe)':
+            if not pd.isna(row['Lower_Abs_Time']) and row['Lower_Abs_Time'] <= final_end_time:
                 fig.add_trace(go.Scatter(
-                    x=[0, final_end_time], y=[thresh, thresh], mode='lines', name=f"T={thresh:.2f} (Safe)",
-                    line=dict(color='gray', width=2, dash='dot'), opacity=0.5
+                    x=[row['Lower_Abs_Time']], y=[thresh], mode='markers', showlegend=False,
+                    marker=dict(symbol='triangle-right', color=c, size=10, line=dict(color='black', width=1))
                 ))
-                if idx == 0 or rul_df.iloc[idx-1]['Status'] != 'Never Reached (Safe)':
-                    ceil = row['Ceiling_Max']
-                    if not pd.isna(ceil):
-                        fig.add_trace(go.Scatter(
-                            x=[0, final_end_time], y=[ceil, ceil], mode='lines', name=f'Ceiling ({ceil:.2f})',
-                            line=dict(color='green', width=1.5, dash='dash')
-                        ))
 
+    # Axis Limits
     max_target = max(thresholds) if thresholds is not None else 0
     absolute_y_max = max(np.max(sensor_arr), max_target)
     absolute_y_min = min(0, np.min(sensor_arr))
@@ -466,8 +421,9 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     y_upper_limit = absolute_y_max + y_padding
     y_lower_limit = absolute_y_min - (y_padding if absolute_y_min < 0 else 0)
 
+    # Compile the final UI Title
     main_title = f"Predictive Analytics | Engine: {model_choice} {title_addon}"
-    subtitle_html = "<br>".join([f"<span style='font-size:12px; color:gray;'>{line}</span>" for line in status_lines])
+    subtitle_html = "<br>".join([f"<span style='font-size:14px; color:gray;'>{line}</span>" for line in status_lines])
     full_title = f"<b>{main_title}</b><br>{subtitle_html}"
 
     fig.update_layout(
@@ -475,14 +431,11 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
         xaxis_title=f"Elapsed Time ({target_time_unit})",
         yaxis_title="Sensor Value",
         xaxis=dict(range=[0, final_end_time]),
-        yaxis=dict(
-            range=[y_lower_limit, y_upper_limit],
-            hoverformat=".3f" 
-        ),
+        yaxis=dict(range=[y_lower_limit, y_upper_limit], hoverformat=".3f"),
         hovermode="x unified",
         template="plotly_white",
         legend=dict(title="System Log", yanchor="top", y=1, xanchor="left", x=1.02, bordercolor="LightSteelBlue", borderwidth=1),
-        margin=dict(t=120),
+        margin=dict(t=120 + (len(thresholds)*15)), # Expand top margin dynamically to fit subtitle text
         width=1400, height=800
     )
     
@@ -500,7 +453,7 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
 # ---------------------------------------------------------
 @st.cache_data
 def get_available_channels(file_obj):
-    file_obj.seek(0) # Reset file pointer to the top
+    file_obj.seek(0) 
     df = pd.read_csv(file_obj, nrows=1)
     cols = [col for col in df.columns if 'Error' not in col and col != 'DateTime']
     if 'Thermo_Valve_Temperature_DeviationPct' in cols:
@@ -513,7 +466,7 @@ def load_my_sensor_data(file_obj, col='32'):
     freq = '4h'
     column_names=[]
     
-    file_obj.seek(0) # Reset file pointer again before full load
+    file_obj.seek(0)
     df = pd.read_csv(file_obj, parse_dates=['DateTime'])
         
     df.set_index('DateTime', inplace=True)
@@ -530,7 +483,8 @@ def load_my_sensor_data(file_obj, col='32'):
     df_select = df_select.ffill().bfill()
     
     try:
-        df_select = du.filter_outliers_quantile(df_select, factor=3)
+        # Assuming you have du.filter_outliers_quantile in your real code, using local function here
+        df_select = filter_outliers_quantile(df_select, factor=3)
     except NameError:
         pass 
         
@@ -554,13 +508,9 @@ def main():
     st.set_page_config(page_title="RUL Predictor", layout="wide")
     st.title("Predictive Maintenance: Dynamic RUL Engine")
 
-    # --- UI SIDEBAR CONTROLS ---
     st.sidebar.header("📁 Data Input")
-    
-    # 1. NEW: The File Uploader
     uploaded_file = st.sidebar.file_uploader("Upload Sensor Data (CSV)", type=['csv'])
 
-    # Stop the app gracefully if no file is uploaded yet
     if uploaded_file is None:
         st.info("👋 Welcome! Please upload your sensor data CSV in the sidebar to begin.")
         st.stop()
@@ -580,7 +530,6 @@ def main():
     selected_col = selected_display.split(" ")[0]
 
     window_size = st.sidebar.number_input("2. Window Size (Lookback)", min_value=10, max_value=5000, value=300, step=10)
-
     eval_window = st.sidebar.number_input("3. MSE Eval Window (Last N points)", min_value=1, max_value=window_size, value=min(50, window_size), step=1)
 
     st.sidebar.markdown("### 4. Model Override")
@@ -596,9 +545,6 @@ def main():
     st.sidebar.markdown("### 6. Display Limits")
     max_rul = st.sidebar.number_input("Max RUL Cap (Days)", min_value=1, max_value=5000, value=365)
 
-    # --- END SIDEBAR ---
-
-    # Load data using the newly uploaded file!
     sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(uploaded_file, col=selected_col)
 
     max_index = len(time_arr) - 1
@@ -671,7 +617,7 @@ def main():
             st.markdown("### ⏳ RUL Projections")
             if not rul_df.empty:
                 display_rul_df = rul_df[[
-                    'Threshold', 'Status', 'Nominal_RUL', 'Conservative_RUL'
+                    'Threshold', 'Status', 'Nominal_RUL', 'Upper_Band_RUL', 'Lower_Band_RUL'
                 ]].copy()
                 
                 def cap_df_rul(val):
@@ -680,7 +626,8 @@ def main():
                     return round(val, 2)
 
                 display_rul_df['Nominal_RUL'] = display_rul_df['Nominal_RUL'].apply(cap_df_rul)
-                display_rul_df['Conservative_RUL'] = display_rul_df['Conservative_RUL'].apply(cap_df_rul)
+                display_rul_df['Upper_Band_RUL'] = display_rul_df['Upper_Band_RUL'].apply(cap_df_rul)
+                display_rul_df['Lower_Band_RUL'] = display_rul_df['Lower_Band_RUL'].apply(cap_df_rul)
                 
                 st.dataframe(display_rul_df, use_container_width=True, hide_index=True)
             else:
