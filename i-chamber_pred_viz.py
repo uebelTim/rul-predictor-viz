@@ -148,9 +148,8 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
 def detect_structural_break(time_arr, sensor_arr, global_slope=None, baseline_pct=0.20, slack_factor=0.5, threshold_factor=5.0):
     """
     Detects a structural break using a Tabular CUSUM algorithm.
-    If global_slope is provided, it uses the shared trend but a local intercept.
+    Includes a variance floor and blindfolds the training period to prevent hyper-sensitivity.
     """
-    # --- THE FIX: Force Pandas Series into NumPy arrays to prevent KeyErrors ---
     time_arr = np.asarray(time_arr, dtype=float)
     sensor_arr = np.asarray(sensor_arr, dtype=float)
     
@@ -172,10 +171,15 @@ def detect_structural_break(time_arr, sensor_arr, global_slope=None, baseline_pc
     preds = slope * time_arr + intercept
     residuals = sensor_arr - preds
     
-    # Calculate baseline statistics (using local variance)
-    base_std = np.std(residuals[:n_base])
-    if base_std == 0:
-        base_std = 1e-5 
+    # Calculate baseline statistics
+    raw_base_std = np.std(residuals[:n_base])
+    
+    # FAILSAFE: The Variance Floor. 
+    # Ensure the standard deviation is never artificially tiny relative to the data's true scale.
+    data_range = np.max(sensor_arr) - np.min(sensor_arr)
+    min_allowable_std = data_range * 0.02 # Enforce a minimum 2% scale variance
+    
+    base_std = max(raw_base_std, min_allowable_std, 1e-5)
         
     slack = slack_factor * base_std
     threshold = threshold_factor * base_std
@@ -184,8 +188,8 @@ def detect_structural_break(time_arr, sensor_arr, global_slope=None, baseline_pc
     cusum = np.zeros(len(residuals))
     break_idx = None
     
-    for i in range(1, len(residuals)):
-        # Now residuals[i] works perfectly because it's a pure NumPy array
+    # CRITICAL FIX: Only start looking for breaks AFTER the training baseline is over.
+    for i in range(n_base, len(residuals)):
         cusum[i] = max(0, cusum[i-1] + residuals[i] - slack)
         
         if cusum[i] > threshold and break_idx is None:
@@ -652,9 +656,9 @@ def main():
     
     col_s, col_t = st.sidebar.columns(2)
     with col_s:
-        cusum_slack = st.number_input("Slack (Tolerance)", min_value=0.1, max_value=5.0, value=1.5, step=0.1, help="Higher = ignores larger daily spikes.")
+        cusum_slack = st.number_input("Slack (Tolerance)", min_value=0.1, max_value=10.0, value=3, step=0.1, help="Higher = ignores larger daily spikes.")
     with col_t:
-        cusum_threshold = st.number_input("Alarm Threshold", min_value=1.0, max_value=50.0, value=15.0, step=1.0, help="Higher = requires more sustained damage before triggering.")
+        cusum_threshold = st.number_input("Alarm Threshold", min_value=1.0, max_value=500.0, value=30.0, step=1.0, help="Higher = requires more sustained damage before triggering.")
     # 1. Load Data
     sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(uploaded_file, col=selected_col)
     
