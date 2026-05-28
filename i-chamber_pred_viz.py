@@ -601,12 +601,10 @@ def load_my_sensor_data(file_obj, col='32'):
     
     return df_defect_daily[f'{col}_max_ema'], df_defect_daily[f'{col}_max'], df_defect_daily['elapsed_days']
 
-
 # ---------------------------------------------------------
 # 6. The Main UI Function
 # ---------------------------------------------------------
 def main():
-    max_rul=365
     st.set_page_config(page_title="RUL Predictor", layout="wide")
     st.title("Predictive Maintenance: Dynamic RUL Engine")
 
@@ -643,13 +641,14 @@ def main():
         sorted_models = sort_items(AVAILABLE_MODELS, direction='vertical')
         user_priority_dict = {model: rank for rank, model in enumerate(sorted_models, start=1)}
 
-    # st.sidebar.markdown("### 6. Display Limits")
-    # max_rul = st.sidebar.number_input("Max RUL Cap (Days)", min_value=1, max_value=5000, value=365)
+    st.sidebar.markdown("### 6. Display Limits")
+    max_rul = st.sidebar.number_input("Max RUL Cap (Days)", min_value=1, max_value=5000, value=365)
     
-    st.sidebar.markdown("### 6. Variance Configuration")
+    st.sidebar.markdown("### 7. Variance Configuration")
     use_dynamic_variance = st.sidebar.toggle("Use Dynamic Variance (Linear Fit)", value=True, help="If off, uses a static variance (the last recorded standard deviation) across the entire future curve.")
 
-    st.sidebar.markdown("### 7. Structural Break (CUSUM) Tuning")
+    # NEW: Rolling Slope UI Parameters
+    st.sidebar.markdown("### 8. Structural Break (Rolling Slope)")
     break_window = st.sidebar.number_input("Rolling Window Size", min_value=7, max_value=90, value=21, step=1, help="Days to look back to calculate the current trend slope.")
     
     col_s, col_t = st.sidebar.columns(2)
@@ -657,11 +656,19 @@ def main():
         slope_thresh = st.number_input("Severity Threshold (%)", min_value=0.5, max_value=50.0, value=5.0, step=0.5, help="Slope required to rise this % of total range in 30 days.")
     with col_t:
         break_sustained = st.number_input("Sustained Days", min_value=1, max_value=14, value=3, step=1, help="Consecutive days the slope must stay high to trigger the break.")
+
     # 1. Load Data
     sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(uploaded_file, col=selected_col)
     
-    # 2. Calculate the global trend constraint for CUSUM
-    global_slope = calculate_global_baseline_slope(uploaded_file)
+    # 2. GLOBAL STRUCTURAL BREAK DETECTION
+    # Runs exactly once on the ENTIRE dataset to find the true historical break.
+    break_idx, break_time = detect_structural_break(
+        time_arr, 
+        sensor_arr_smooth, 
+        window=break_window,
+        threshold_pct=slope_thresh,
+        sustained_points=break_sustained
+    )
 
     max_index = len(time_arr) - 1
     thresholds = [0.2, 0.5, 1.0]
@@ -677,22 +684,7 @@ def main():
         sliced_sensor = sensor_arr_smooth[start_idx:cutoff_idx]
         sliced_sensor_raw = sensor_array_raw[start_idx:cutoff_idx]
         
-        # 3. Detect Structural Breaks on the history leading up to the current cutoff
-        # 3. Detect Structural Breaks on the history leading up to the current cutoff
-        # 3. Detect Structural Breaks on the history leading up to the current cutoff
-        history_time = time_arr[:cutoff_idx]
-        history_sensor = sensor_arr_smooth[:cutoff_idx]
-        
-        # You can safely remove the 'global_slope' calculation as this method works purely on local velocity
-        break_idx, break_time = detect_structural_break(
-            history_time, 
-            history_sensor, 
-            window=break_window,
-            threshold_pct=slope_thresh,
-            sustained_points=break_sustained
-        )
-        
-        # 4. Route the Curve Fitting
+        # 3. Route the Curve Fitting
         top_models, all_models = evaluate_all_models(
             sliced_time, sliced_sensor, 
             priority_ranking=user_priority_dict, 
@@ -709,7 +701,7 @@ def main():
         else:
             best_model_name = list(top_models.keys())[0]
         
-        # 5. Fit, Calculate Variance, and Plot
+        # 4. Fit, Calculate Variance, and Plot
         fig, fitted_series, rul_df = fit_and_plotly_model(
             time_raw=sliced_time,
             sensor_smooth=sliced_sensor,
@@ -720,7 +712,7 @@ def main():
             title_addon=f"| Channel: {selected_col} | Cutoff: {cutoff_idx}",
             max_rul_display=max_rul,
             use_dynamic_variance=use_dynamic_variance,
-            break_time_raw=break_time
+            break_time_raw=break_time # Pass the globally found break_time here
         )
         
         plot_col, side_metrics_col = st.columns([3, 1])
