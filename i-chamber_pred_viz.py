@@ -141,13 +141,65 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
 
     return top_models_sorted, full_leaderboard
 
+
 # ---------------------------------------------------------
-# 3. Dynamic/Static Variance & RUL Plotting
+# 3. Structural Break Detector (CUSUM)
+# ---------------------------------------------------------
+def detect_structural_break(time_arr, sensor_arr, global_slope=None, baseline_pct=0.20, slack_factor=0.5, threshold_factor=5.0):
+    """
+    Detects a structural break using a Tabular CUSUM algorithm.
+    If global_slope is provided, it uses the shared trend but a local intercept.
+    """
+    if len(sensor_arr) < 10:
+        return None, None
+        
+    n_base = max(5, int(len(sensor_arr) * baseline_pct))
+    t_base = time_arr[:n_base]
+    y_base = sensor_arr[:n_base]
+    
+    # Fit the baseline (Global Slope, Local Intercept OR Pure Local)
+    if global_slope is not None:
+        slope = global_slope
+        intercept = np.mean(y_base - slope * t_base) 
+    else:
+        slope, intercept = np.polyfit(t_base, y_base, 1)
+    
+    # Calculate residuals across the whole provided array
+    preds = slope * time_arr + intercept
+    residuals = sensor_arr - preds
+    
+    # Calculate baseline statistics (using local variance)
+    base_std = np.std(residuals[:n_base])
+    if base_std == 0:
+        base_std = 1e-5 
+        
+    slack = slack_factor * base_std
+    threshold = threshold_factor * base_std
+    
+    # Tabular CUSUM
+    cusum = np.zeros(len(residuals))
+    break_idx = None
+    
+    for i in range(1, len(residuals)):
+        cusum[i] = max(0, cusum[i-1] + residuals[i] - slack)
+        
+        if cusum[i] > threshold and break_idx is None:
+            break_idx = i
+            break 
+            
+    if break_idx is not None:
+        return break_idx, time_arr[break_idx]
+        
+    return None, None
+
+
+# ---------------------------------------------------------
+# 4. Dynamic/Static Variance & RUL Plotting
 # ---------------------------------------------------------
 def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thresholds=None, 
                          input_time_unit="Hours", target_time_unit="Days", warm_start_params=None, 
                          title_addon="", sigma_factor=1.645, save_name=None, max_rul_display=365,
-                         use_dynamic_variance=True):
+                         use_dynamic_variance=True, break_time_raw=None):
     if isinstance(sensor_smooth, pd.Series):
         orig_index = sensor_smooth.index
     elif isinstance(time_raw, pd.Series):
@@ -242,12 +294,8 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
                 return base_val - target_val
 
         try:
-            # We no longer filter out negative roots. If a root is negative, 
-            # it means the threshold was breached in the past.
             t_solution = fsolve(target_equation, 1.0)[0]
             
-            # If the solver fails to converge on a valid root, we check if the 
-            # current value (t=1.0) is already above the target. If yes, force a breach.
             if abs(target_equation(t_solution)) > 1e-3:
                 if target_equation(1.0) >= 0:
                     return -999.0 
@@ -418,6 +466,20 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
                     marker=dict(symbol='triangle-right', color=c, size=10, line=dict(color='black', width=1))
                 ))
 
+    # --- Structural Break Visuals ---
+    break_title_str = ""
+    if break_time_raw is not None:
+        break_time_converted = break_time_raw * conversion_factor
+        fig.add_vline(x=break_time_converted, line_width=2, line_dash="dash", line_color="orange")
+        fig.add_annotation(
+            x=break_time_converted, y=np.max(sensor_arr) * 1.05 if np.max(sensor_arr) > 0 else 0,
+            text="⚠️ Structural Break", showarrow=False,
+            yshift=10, font=dict(color="orange", size=12)
+        )
+        break_title_str = f" | <span style='color:orange;'><b>⚠️ Break Detected at {break_time_converted:.1f}{unit_short}</b></span>"
+    else:
+        break_title_str = f" | <span style='color:green;'><b>✅ Stable (No Break)</b></span>"
+
     # Axis Limits
     max_target = max(thresholds) if thresholds is not None else 0
     absolute_y_max = max(np.max(sensor_arr), max_target)
@@ -427,7 +489,7 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     y_lower_limit = absolute_y_min - (y_padding if absolute_y_min < 0 else 0)
 
     # Compile Title
-    main_title = f"Predictive Analytics | Engine: {model_choice} {title_addon}"
+    main_title = f"Predictive Analytics | Engine: {model_choice} {title_addon}{break_title_str}"
     subtitle_html = "<br>".join([f"<span style='font-size:14px; color:gray;'>{line}</span>" for line in status_lines])
     full_title = f"<b>{main_title}</b><br>{subtitle_html}"
 
@@ -454,7 +516,7 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
 
 
 # ---------------------------------------------------------
-# 4. Data Loading & Extraction Functions
+# 5. Data Loading & Extraction Functions
 # ---------------------------------------------------------
 @st.cache_data
 def get_available_channels(file_obj):
@@ -464,6 +526,35 @@ def get_available_channels(file_obj):
     if 'Thermo_Valve_Temperature_DeviationPct' in cols:
         cols.remove('Thermo_Valve_Temperature_DeviationPct')
     return [str(c) for c in cols]
+
+
+@st.cache_data
+def calculate_global_baseline_slope(file_obj, baseline_pct=0.20):
+    """
+    Calculates the universal 'healthy' slope by averaging the first 20% 
+    of all available columns (since they are identical component types).
+    """
+    file_obj.seek(0)
+    df = pd.read_csv(file_obj, parse_dates=['DateTime'])
+    df.set_index('DateTime', inplace=True)
+    df = df[~df.index.duplicated(keep='first')]
+    
+    df_daily = df.resample('D').mean(numeric_only=True)
+    
+    cols = [c for c in df_daily.columns if 'Error' not in c and c != 'Thermo_Valve_Temperature_DeviationPct']
+    global_mean = df_daily[cols].mean(axis=1).bfill().ffill()
+    
+    n_base = max(5, int(len(global_mean) * baseline_pct))
+    y_base = global_mean.iloc[:n_base].values
+    
+    t_base = (global_mean.index[:n_base] - global_mean.index[0]).days.values
+    
+    if len(t_base) > 1:
+        slope, _ = np.polyfit(t_base, y_base, 1)
+    else:
+        slope = 0.0
+        
+    return slope
 
 
 @st.cache_data
@@ -506,7 +597,7 @@ def load_my_sensor_data(file_obj, col='32'):
 
 
 # ---------------------------------------------------------
-# 5. The Main UI Function
+# 6. The Main UI Function
 # ---------------------------------------------------------
 def main():
     st.set_page_config(page_title="RUL Predictor", layout="wide")
@@ -551,7 +642,11 @@ def main():
     st.sidebar.markdown("### 7. Variance Configuration")
     use_dynamic_variance = st.sidebar.toggle("Use Dynamic Variance (Linear Fit)", value=True, help="If off, uses a static variance (the last recorded standard deviation) across the entire future curve.")
 
+    # 1. Load Data
     sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(uploaded_file, col=selected_col)
+    
+    # 2. Calculate the global trend constraint for CUSUM
+    global_slope = calculate_global_baseline_slope(uploaded_file)
 
     max_index = len(time_arr) - 1
     thresholds = [0.2, 0.5, 1.0]
@@ -567,6 +662,12 @@ def main():
         sliced_sensor = sensor_arr_smooth[start_idx:cutoff_idx]
         sliced_sensor_raw = sensor_array_raw[start_idx:cutoff_idx]
         
+        # 3. Detect Structural Breaks on the history leading up to the current cutoff
+        history_time = time_arr[:cutoff_idx]
+        history_sensor = sensor_arr_smooth[:cutoff_idx]
+        break_idx, break_time = detect_structural_break(history_time, history_sensor, global_slope=global_slope)
+        
+        # 4. Route the Curve Fitting
         top_models, all_models = evaluate_all_models(
             sliced_time, sliced_sensor, 
             priority_ranking=user_priority_dict, 
@@ -583,6 +684,7 @@ def main():
         else:
             best_model_name = list(top_models.keys())[0]
         
+        # 5. Fit, Calculate Variance, and Plot
         fig, fitted_series, rul_df = fit_and_plotly_model(
             time_raw=sliced_time,
             sensor_smooth=sliced_sensor,
@@ -592,7 +694,8 @@ def main():
             input_time_unit="Days", 
             title_addon=f"| Channel: {selected_col} | Cutoff: {cutoff_idx}",
             max_rul_display=max_rul,
-            use_dynamic_variance=use_dynamic_variance
+            use_dynamic_variance=use_dynamic_variance,
+            break_time_raw=break_time
         )
         
         plot_col, side_metrics_col = st.columns([3, 1])
@@ -627,7 +730,6 @@ def main():
                     'Threshold', 'Status', 'Nominal_RUL', 'Upper_Band_RUL', 'Lower_Band_RUL'
                 ]].copy()
                 
-                # Update DataFrame logic to elegantly handle the 'Safe' strings without crashing
                 def cap_df_rul(val):
                     if val == 'Safe': return 'Safe'
                     if pd.isna(val): return 'Unknown'
