@@ -150,6 +150,10 @@ def detect_structural_break(time_arr, sensor_arr, global_slope=None, baseline_pc
     Detects a structural break using a Tabular CUSUM algorithm.
     If global_slope is provided, it uses the shared trend but a local intercept.
     """
+    # --- THE FIX: Force Pandas Series into NumPy arrays to prevent KeyErrors ---
+    time_arr = np.asarray(time_arr, dtype=float)
+    sensor_arr = np.asarray(sensor_arr, dtype=float)
+    
     if len(sensor_arr) < 10:
         return None, None
         
@@ -181,6 +185,7 @@ def detect_structural_break(time_arr, sensor_arr, global_slope=None, baseline_pc
     break_idx = None
     
     for i in range(1, len(residuals)):
+        # Now residuals[i] works perfectly because it's a pure NumPy array
         cusum[i] = max(0, cusum[i-1] + residuals[i] - slack)
         
         if cusum[i] > threshold and break_idx is None:
@@ -191,7 +196,6 @@ def detect_structural_break(time_arr, sensor_arr, global_slope=None, baseline_pc
         return break_idx, time_arr[break_idx]
         
     return None, None
-
 
 # ---------------------------------------------------------
 # 4. Dynamic/Static Variance & RUL Plotting
