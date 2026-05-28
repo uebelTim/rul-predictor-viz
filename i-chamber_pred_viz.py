@@ -9,9 +9,6 @@ from streamlit_sortables import sort_items
 #import diagnostic_utils as du 
 
 def filter_outliers_quantile(df, factor=1.5, keep_nans=True):
-    """
-    Filter out outliers from a DataFrame using the Interquartile Range (IQR) method.
-    """
     df_numeric = df.apply(pd.to_numeric, errors='coerce')
     original_nans = df_numeric.isna()
     
@@ -60,7 +57,7 @@ AVAILABLE_MODELS = [
 ]
 
 # ---------------------------------------------------------
-# 2. Master Fitting and Comparison Function
+# 2. Master Fitting Function
 # ---------------------------------------------------------
 def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=None, tolerance_pct=0.5, plot=False, verbose=True, Title_addon="", save_name=None):
     time_arr = np.asarray(time_data)
@@ -145,11 +142,12 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
     return top_models_sorted, full_leaderboard
 
 # ---------------------------------------------------------
-# 3. Dynamic Variance & Dual Envelope RUL Plotting
+# 3. Dynamic/Static Variance & RUL Plotting
 # ---------------------------------------------------------
 def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thresholds=None, 
                          input_time_unit="Hours", target_time_unit="Days", warm_start_params=None, 
-                         title_addon="", sigma_factor=1.645, save_name=None, max_rul_display=365):
+                         title_addon="", sigma_factor=1.645, save_name=None, max_rul_display=365,
+                         use_dynamic_variance=True): # NEW ARGUMENT ADDED HERE
     if isinstance(sensor_smooth, pd.Series):
         orig_index = sensor_smooth.index
     elif isinstance(time_raw, pd.Series):
@@ -197,21 +195,21 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     residuals_series = pd.Series(sensor_raw - fitted_series, index=orig_index, name=f"{model_choice}_Residuals")
     
     # ---------------------------------------------------------
-    # DYNAMIC VARIANCE CALCULATION
+    # VARIANCE CALCULATION (DYNAMIC OR STATIC)
     # ---------------------------------------------------------
-    # Calculate rolling STD on ALL residuals (assuming Gaussian spread)
     rolling_std = residuals_series.rolling(window=20, min_periods=1).std()
     rolling_std = rolling_std.bfill().fillna(0) 
 
-    # Linear Fit on the Rolling Standard Deviation
     valid_mask = ~np.isnan(rolling_std)
-    if valid_mask.sum() > 1:
+    
+    # NEW LOGIC: Toggle between linear fit and static last-value
+    if use_dynamic_variance and valid_mask.sum() > 1:
         std_slope, std_intercept = np.polyfit(time_norm[valid_mask], rolling_std[valid_mask], 1)
     else:
+        # Static mode forces the slope to 0 and uses the last known standard deviation
         std_slope, std_intercept = 0.0, rolling_std.iloc[-1]
 
     def get_dynamic_std(t_norm_val):
-        # Prevent variance from artificially dropping below zero
         return np.maximum(0.0, std_slope * t_norm_val + std_intercept)
 
     current_margin = get_dynamic_std(1.0) * sigma_factor
@@ -220,10 +218,9 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     risk_pct_lower = cdf * 100
 
     # ---------------------------------------------------------
-    # RUL ROOT FINDING (WITH ASYMPTOTE GATEKEEPER)
+    # RUL ROOT FINDING
     # ---------------------------------------------------------
     def solve_for_dynamic_t(target_val, mode='nominal'):
-        """ mode: 'nominal', 'upper', 'lower' """
         t_infinite = 10000.0 
         ceiling_base = config['func'](t_infinite, *params)
         
@@ -270,7 +267,6 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
             upper_time = solve_for_dynamic_t(thresh, mode='upper') 
             lower_time = solve_for_dynamic_t(thresh, mode='lower') 
             
-            # Convert to numeric RULs or NaN
             def calc_rul(t_val):
                 return (t_val - raw_current_time) * conversion_factor if isinstance(t_val, float) else np.nan
             def calc_abs(t_val):
@@ -279,7 +275,6 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
             nom_rul, upper_rul, lower_rul = calc_rul(nom_time), calc_rul(upper_time), calc_rul(lower_time)
             nom_abs, upper_abs, lower_abs = calc_abs(nom_time), calc_abs(upper_time), calc_abs(lower_time)
 
-            # Determine Status
             if nom_time == 'Safe':
                 status = 'Never Reached (Safe)'
             elif not np.isnan(nom_rul) and nom_rul < 0:
@@ -289,7 +284,6 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
             else:
                 status = 'Predicted Future'
             
-            # Extend plot boundary to the furthest RUL
             valid_times = [t for t in [nom_abs, upper_abs, lower_abs] if not np.isnan(t)]
             if valid_times:
                 plot_end_time_raw = max(plot_end_time_raw, max(valid_times) / conversion_factor * 1.1)
@@ -314,7 +308,6 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     max_zoom_limit = current_time_converted * 2.5
     final_end_time = min(plot_end_time_converted, max_zoom_limit)
     
-    # Smooth arrays for the future curves
     time_smooth_converted = np.linspace(0, final_end_time, 500)
     time_smooth_norm = (time_smooth_converted / conversion_factor) / t_max
     
@@ -326,43 +319,39 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     
     fig = go.Figure()
 
-    # Scatter: Original Data (Max Envelope)
     fig.add_trace(go.Scatter(
         x=time_arr_converted, y=sensor_raw, mode='markers', name='Max Envelope Data',
         marker=dict(color='gray', size=5, opacity=0.7)
     ))
 
-    # Main Fit Line
     fig.add_trace(go.Scatter(
         x=time_smooth_converted, y=smooth_preds, mode='lines', name=f'{model_choice} Fit',
         line=dict(color='blue', width=2.5), opacity=0.8
     ))
 
-    # Lower Envelope Band (Invisible line, used for fill boundary)
     fig.add_trace(go.Scatter(
         x=time_smooth_converted, y=lower_env_smooth, mode='lines', 
         line=dict(width=0), showlegend=False, hoverinfo='skip'
     ))
 
-    # Upper Envelope Band (Fills down to the lower envelope)
+    band_name = f'±{sigma_factor}σ Confidence Band' + (' (Dynamic)' if use_dynamic_variance else ' (Static)')
     fig.add_trace(go.Scatter(
         x=time_smooth_converted, y=upper_env_smooth, mode='lines', 
         line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 0, 255, 0.15)', 
-        name=f'±{sigma_factor}σ Confidence Band'
+        name=band_name
     ))
 
-    # Projected dashed lines for boundaries
     fig.add_trace(go.Scatter(
-        x=time_smooth_converted, y=upper_env_smooth, mode='lines', name=f'Upper Threshold ({risk_pct_upper:.1f}% Risk)',
+        x=time_smooth_converted, y=upper_env_smooth, mode='lines', name=f'Upper Band ({risk_pct_upper:.1f}% Risk)',
         line=dict(color='blue', width=1.5, dash='dashdot'), opacity=0.6
     ))
     fig.add_trace(go.Scatter(
-        x=time_smooth_converted, y=lower_env_smooth, mode='lines', name=f'Lower Threshold ({risk_pct_lower:.1f}% Risk)',
+        x=time_smooth_converted, y=lower_env_smooth, mode='lines', name=f'Lower Band ({risk_pct_lower:.1f}% Risk)',
         line=dict(color='blue', width=1.5, dash='dot'), opacity=0.4
     ))
     
     # ---------------------------------------------------------
-    # ANNOTATIONS & DYNAMIC TITLES
+    # ANNOTATIONS & LEGEND / TITLES
     # ---------------------------------------------------------
     unit_short = {"Seconds": "s", "Minutes": "m", "Hours": "h", "Days": "d"}.get(target_time_unit, target_time_unit)
     colors = ['#FFA500', '#FF0000', '#8B0000', '#800080', '#000000']
@@ -384,19 +373,21 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
             u_str = format_rul(row['Upper_Band_RUL'])
             l_str = format_rul(row['Lower_Band_RUL'])
             
-            # Format the subtitle string perfectly for UI
             if status == 'Never Reached (Safe)':
                 status_lines.append(f"<b>T={thresh:.2f}:</b> {status}")
+                legend_lbl = f"T={thresh:.2f} (Safe)"
             else:
-                status_lines.append(f"<b>T={thresh:.2f} RUL</b> &rarr; <b>Nominal:</b> {n_str} | <b>Upper Risk (Earliest):</b> {u_str} | <b>Lower Risk (Latest):</b> {l_str}")
+                # Title formatting uses a clear unicode arrow to prevent HTML parsing errors
+                status_lines.append(f"<b>T={thresh:.2f} RUL</b> ➔ <b>Nominal:</b> {n_str} | <b>Upper Risk:</b> {u_str} | <b>Lower Risk:</b> {l_str}")
+                # Legend formatting restored to show values in the right-hand box
+                legend_lbl = f"T={thresh:.2f} (Nom: {n_str} | Up: {u_str} | Low: {l_str})"
             
-            # Draw the horizontal threshold line
+            # Draw threshold line WITH the detailed label for the legend
             fig.add_trace(go.Scatter(
-                x=[0, final_end_time], y=[thresh, thresh], mode='lines', name=f"Threshold {thresh}",
+                x=[0, final_end_time], y=[thresh, thresh], mode='lines', name=legend_lbl,
                 line=dict(color=c, width=2, dash='dash'), opacity=0.6
             ))
             
-            # Plot the specific crossing points if they exist within the timeline
             if not pd.isna(row['Nominal_Abs_Time']) and row['Nominal_Abs_Time'] <= final_end_time:
                 fig.add_trace(go.Scatter(
                     x=[row['Nominal_Abs_Time']], y=[thresh], mode='markers', showlegend=False,
@@ -421,7 +412,7 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     y_upper_limit = absolute_y_max + y_padding
     y_lower_limit = absolute_y_min - (y_padding if absolute_y_min < 0 else 0)
 
-    # Compile the final UI Title
+    # Compile Title
     main_title = f"Predictive Analytics | Engine: {model_choice} {title_addon}"
     subtitle_html = "<br>".join([f"<span style='font-size:14px; color:gray;'>{line}</span>" for line in status_lines])
     full_title = f"<b>{main_title}</b><br>{subtitle_html}"
@@ -435,7 +426,7 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
         hovermode="x unified",
         template="plotly_white",
         legend=dict(title="System Log", yanchor="top", y=1, xanchor="left", x=1.02, bordercolor="LightSteelBlue", borderwidth=1),
-        margin=dict(t=120 + (len(thresholds)*15)), # Expand top margin dynamically to fit subtitle text
+        margin=dict(t=120 + (len(thresholds)*15)), 
         width=1400, height=800
     )
     
@@ -483,7 +474,6 @@ def load_my_sensor_data(file_obj, col='32'):
     df_select = df_select.ffill().bfill()
     
     try:
-        # Assuming you have du.filter_outliers_quantile in your real code, using local function here
         df_select = filter_outliers_quantile(df_select, factor=3)
     except NameError:
         pass 
@@ -537,13 +527,16 @@ def main():
     manual_model = st.sidebar.selectbox("Force specific model:", options=AVAILABLE_MODELS, disabled=not override_model)
 
     st.sidebar.markdown("### 5. Router Priority Ranking")
-    st.sidebar.caption("Drag and drop models to set priority (Top = 1, Highest Priority).")
     with st.sidebar.expander("Configure Router Ranking", expanded=False):
         sorted_models = sort_items(AVAILABLE_MODELS, direction='vertical')
         user_priority_dict = {model: rank for rank, model in enumerate(sorted_models, start=1)}
 
     st.sidebar.markdown("### 6. Display Limits")
     max_rul = st.sidebar.number_input("Max RUL Cap (Days)", min_value=1, max_value=5000, value=365)
+    
+    # NEW TOGGLE ADDED HERE
+    st.sidebar.markdown("### 7. Variance Configuration")
+    use_dynamic_variance = st.sidebar.toggle("Use Dynamic Variance (Linear Fit)", value=True, help="If off, uses a static variance (the last recorded standard deviation) across the entire future curve.")
 
     sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(uploaded_file, col=selected_col)
 
@@ -577,6 +570,7 @@ def main():
         else:
             best_model_name = list(top_models.keys())[0]
         
+        # PASS THE TOGGLE STATE TO THE FUNCTION
         fig, fitted_series, rul_df = fit_and_plotly_model(
             time_raw=sliced_time,
             sensor_smooth=sliced_sensor,
@@ -585,7 +579,8 @@ def main():
             thresholds=thresholds,
             input_time_unit="Days", 
             title_addon=f"| Channel: {selected_col} | Cutoff: {cutoff_idx}",
-            max_rul_display=max_rul  
+            max_rul_display=max_rul,
+            use_dynamic_variance=use_dynamic_variance
         )
         
         plot_col, side_metrics_col = st.columns([3, 1])
