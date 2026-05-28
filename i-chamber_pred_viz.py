@@ -604,6 +604,7 @@ def load_my_sensor_data(file_obj, col='32'):
 # 6. The Main UI Function
 # ---------------------------------------------------------
 def main():
+    max_rul=365
     st.set_page_config(page_title="RUL Predictor", layout="wide")
     st.title("Predictive Maintenance: Dynamic RUL Engine")
 
@@ -675,9 +676,19 @@ def main():
         sliced_sensor_raw = sensor_array_raw[start_idx:cutoff_idx]
         
         # 3. Detect Structural Breaks on the history leading up to the current cutoff
+        # 3. Detect Structural Breaks on the history leading up to the current cutoff
         history_time = time_arr[:cutoff_idx]
         history_sensor = sensor_arr_smooth[:cutoff_idx]
-        break_idx, break_time = detect_structural_break(history_time, history_sensor, global_slope=global_slope)
+        
+        # Pass the new UI parameters into the detector
+        active_slope = global_slope if use_global_slope else None
+        break_idx, break_time = detect_structural_break(
+            history_time, 
+            history_sensor, 
+            global_slope=active_slope,
+            slack_factor=cusum_slack,        # <-- Adjusted by UI
+            threshold_factor=cusum_threshold # <-- Adjusted by UI
+        )
         
         # 4. Route the Curve Fitting
         top_models, all_models = evaluate_all_models(
