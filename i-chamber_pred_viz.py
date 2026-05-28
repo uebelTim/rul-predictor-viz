@@ -147,7 +147,7 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
 def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thresholds=None, 
                          input_time_unit="Hours", target_time_unit="Days", warm_start_params=None, 
                          title_addon="", sigma_factor=1.645, save_name=None, max_rul_display=365,
-                         use_dynamic_variance=True): # NEW ARGUMENT ADDED HERE
+                         use_dynamic_variance=True):
     if isinstance(sensor_smooth, pd.Series):
         orig_index = sensor_smooth.index
     elif isinstance(time_raw, pd.Series):
@@ -195,18 +195,16 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     residuals_series = pd.Series(sensor_raw - fitted_series, index=orig_index, name=f"{model_choice}_Residuals")
     
     # ---------------------------------------------------------
-    # VARIANCE CALCULATION (DYNAMIC OR STATIC)
+    # VARIANCE CALCULATION
     # ---------------------------------------------------------
     rolling_std = residuals_series.rolling(window=20, min_periods=1).std()
     rolling_std = rolling_std.bfill().fillna(0) 
 
     valid_mask = ~np.isnan(rolling_std)
     
-    # NEW LOGIC: Toggle between linear fit and static last-value
     if use_dynamic_variance and valid_mask.sum() > 1:
         std_slope, std_intercept = np.polyfit(time_norm[valid_mask], rolling_std[valid_mask], 1)
     else:
-        # Static mode forces the slope to 0 and uses the last known standard deviation
         std_slope, std_intercept = 0.0, rolling_std.iloc[-1]
 
     def get_dynamic_std(t_norm_val):
@@ -243,13 +241,23 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
             else:
                 return base_val - target_val
 
-        t_guess_initial = 1.0 
         try:
-            t_solution = fsolve(target_equation, t_guess_initial)[0]
-            if abs(target_equation(t_solution)) > 1e-3 or t_solution < 0:
+            # We no longer filter out negative roots. If a root is negative, 
+            # it means the threshold was breached in the past.
+            t_solution = fsolve(target_equation, 1.0)[0]
+            
+            # If the solver fails to converge on a valid root, we check if the 
+            # current value (t=1.0) is already above the target. If yes, force a breach.
+            if abs(target_equation(t_solution)) > 1e-3:
+                if target_equation(1.0) >= 0:
+                    return -999.0 
                 return None 
+                
             return t_solution * t_max
         except Exception:
+            try:
+                if target_equation(1.0) >= 0: return -999.0
+            except: pass
             return None
 
     # ---------------------------------------------------------
@@ -268,18 +276,24 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
             lower_time = solve_for_dynamic_t(thresh, mode='lower') 
             
             def calc_rul(t_val):
-                return (t_val - raw_current_time) * conversion_factor if isinstance(t_val, float) else np.nan
+                if t_val == 'Safe': return 'Safe'
+                return (t_val - raw_current_time) * conversion_factor if isinstance(t_val, (float, int)) else np.nan
+                
             def calc_abs(t_val):
-                return t_val * conversion_factor if isinstance(t_val, float) else np.nan
+                if t_val == 'Safe': return np.nan
+                return t_val * conversion_factor if isinstance(t_val, (float, int)) else np.nan
 
-            nom_rul, upper_rul, lower_rul = calc_rul(nom_time), calc_rul(upper_time), calc_rul(lower_time)
+            nom_rul = calc_rul(nom_time)
+            upper_rul = calc_rul(upper_time)
+            lower_rul = calc_rul(lower_time)
+            
             nom_abs, upper_abs, lower_abs = calc_abs(nom_time), calc_abs(upper_time), calc_abs(lower_time)
 
-            if nom_time == 'Safe':
+            if nom_rul == 'Safe':
                 status = 'Never Reached (Safe)'
-            elif not np.isnan(nom_rul) and nom_rul < 0:
+            elif isinstance(nom_rul, float) and nom_rul < 0:
                 status = 'Already Reached'
-            elif not np.isnan(upper_rul) and upper_rul < 0:
+            elif isinstance(upper_rul, float) and upper_rul < 0:
                 status = 'Envelope Breached'
             else:
                 status = 'Predicted Future'
@@ -358,10 +372,13 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     status_lines = []
     
     def format_rul(val):
-        if pd.isna(val): return "Safe"
-        if val > max_rul_display: return f"> {max_rul_display}{unit_short}"
-        if val < 0: return f"Breached"
-        return f"{val:.1f}{unit_short}"
+        if val == 'Safe': return "Safe"
+        if pd.isna(val): return "Unknown"
+        if isinstance(val, (float, int)):
+            if val < 0: return "Breached"
+            if val > max_rul_display: return f"> {max_rul_display}{unit_short}"
+            return f"{val:.1f}{unit_short}"
+        return str(val)
 
     if not rul_df.empty:
         for idx, row in rul_df.iterrows():
@@ -373,16 +390,13 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
             u_str = format_rul(row['Upper_Band_RUL'])
             l_str = format_rul(row['Lower_Band_RUL'])
             
-            if status == 'Never Reached (Safe)':
-                status_lines.append(f"<b>T={thresh:.2f}:</b> {status}")
+            if status == 'Never Reached (Safe)' and u_str == 'Safe' and l_str == 'Safe':
+                status_lines.append(f"<b>T={thresh:.2f}:</b> Safe")
                 legend_lbl = f"T={thresh:.2f} (Safe)"
             else:
-                # Title formatting uses a clear unicode arrow to prevent HTML parsing errors
-                status_lines.append(f"<b>T={thresh:.2f} RUL</b> ➔ <b>Nominal:</b> {n_str} | <b>Upper Risk:</b> {u_str} | <b>Lower Risk:</b> {l_str}")
-                # Legend formatting restored to show values in the right-hand box
-                legend_lbl = f"T={thresh:.2f} (Nom: {n_str} | Up: {u_str} | Low: {l_str})"
+                status_lines.append(f"<b>T={thresh:.2f} RUL</b> ➔ <b>Nominal:</b> {n_str} | <b>{risk_pct_upper:.1f}% Risk:</b> {u_str} | <b>{risk_pct_lower:.1f}% Risk:</b> {l_str}")
+                legend_lbl = f"T={thresh:.2f} (Nom: {n_str} | {risk_pct_upper:.1f}%: {u_str} | {risk_pct_lower:.1f}%: {l_str})"
             
-            # Draw threshold line WITH the detailed label for the legend
             fig.add_trace(go.Scatter(
                 x=[0, final_end_time], y=[thresh, thresh], mode='lines', name=legend_lbl,
                 line=dict(color=c, width=2, dash='dash'), opacity=0.6
@@ -534,7 +548,6 @@ def main():
     st.sidebar.markdown("### 6. Display Limits")
     max_rul = st.sidebar.number_input("Max RUL Cap (Days)", min_value=1, max_value=5000, value=365)
     
-    # NEW TOGGLE ADDED HERE
     st.sidebar.markdown("### 7. Variance Configuration")
     use_dynamic_variance = st.sidebar.toggle("Use Dynamic Variance (Linear Fit)", value=True, help="If off, uses a static variance (the last recorded standard deviation) across the entire future curve.")
 
@@ -570,7 +583,6 @@ def main():
         else:
             best_model_name = list(top_models.keys())[0]
         
-        # PASS THE TOGGLE STATE TO THE FUNCTION
         fig, fitted_series, rul_df = fit_and_plotly_model(
             time_raw=sliced_time,
             sensor_smooth=sliced_sensor,
@@ -615,10 +627,15 @@ def main():
                     'Threshold', 'Status', 'Nominal_RUL', 'Upper_Band_RUL', 'Lower_Band_RUL'
                 ]].copy()
                 
+                # Update DataFrame logic to elegantly handle the 'Safe' strings without crashing
                 def cap_df_rul(val):
-                    if pd.isna(val) or (isinstance(val, (int, float)) and val > max_rul):
-                        return f"> {max_rul}"
-                    return round(val, 2)
+                    if val == 'Safe': return 'Safe'
+                    if pd.isna(val): return 'Unknown'
+                    if isinstance(val, (int, float)):
+                        if val < 0: return 'Breached'
+                        if val > max_rul: return f"> {max_rul}"
+                        return round(val, 2)
+                    return val
 
                 display_rul_df['Nominal_RUL'] = display_rul_df['Nominal_RUL'].apply(cap_df_rul)
                 display_rul_df['Upper_Band_RUL'] = display_rul_df['Upper_Band_RUL'].apply(cap_df_rul)
