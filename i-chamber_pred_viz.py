@@ -656,7 +656,7 @@ def main():
     
     col_s, col_t = st.sidebar.columns(2)
     with col_s:
-        cusum_slack = st.number_input("Slack (Tolerance)", min_value=0.1, max_value=10.0, value=3, step=0.1, help="Higher = ignores larger daily spikes.")
+        cusum_slack = st.number_input("Slack (Tolerance)", min_value=0.1, max_value=10.0, value=3.0, step=0.1, help="Higher = ignores larger daily spikes.")
     with col_t:
         cusum_threshold = st.number_input("Alarm Threshold", min_value=1.0, max_value=500.0, value=30.0, step=1.0, help="Higher = requires more sustained damage before triggering.")
     # 1. Load Data
