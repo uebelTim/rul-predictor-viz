@@ -690,7 +690,7 @@ def main():
     with col_t:
         break_sustained = st.number_input(
             "Sustained Wins", 
-            min_value=1, max_value=10, value=2, step=1,
+            min_value=1, max_value=10, value=5, step=1,
             help="The exponential model must beat the linear model this many consecutive times to officially trigger the 'Structural Break' alarm. Prevents false positives from random data spikes."
         )
 
