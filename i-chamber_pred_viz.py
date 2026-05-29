@@ -158,7 +158,7 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
 # ---------------------------------------------------------
 # 3. Structural Break Detector (Model Competition)
 # ---------------------------------------------------------
-def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_wins=2):
+def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_wins=5):
     time_arr = np.asarray(time_arr, dtype=float)
     sensor_arr = np.asarray(sensor_arr, dtype=float)
     
@@ -677,7 +677,7 @@ def main():
     break_window = st.sidebar.number_input(
         "Evaluation Window (Days)", 
         min_value=10, max_value=200, value=60, step=10,
-        help="The amount of data analyzed in a single chunk to decide if the trend is linear or exponential. A wider window is more stable against noise, but might detect the break slightly later."
+        help="The amount of data analyzed in a single chunk to decide if the trend is linear or exponential. A wider window is more stable against noise."
     )
     
     col_s, col_t = st.sidebar.columns(2)
@@ -691,7 +691,7 @@ def main():
         break_sustained = st.number_input(
             "Sustained Wins", 
             min_value=1, max_value=10, value=2, step=1,
-            help="The failsafe. The exponential model must beat the linear model this many consecutive times to officially trigger the 'Structural Break' alarm. Prevents false positives from random data spikes."
+            help="The exponential model must beat the linear model this many consecutive times to officially trigger the 'Structural Break' alarm. Prevents false positives from random data spikes."
         )
 
     # 1. Load Data
@@ -707,7 +707,7 @@ def main():
     )
 
     max_index = len(time_arr) - 1
-    thresholds = [0.2, 0.5, 1.0]
+    thresholds = [0.2, 1.0]
 
     st.markdown("### Time Navigation")
     cutoff_idx = st.slider("Select the Current Time Point (Data Cutoff)", min_value=10, max_value=max_index, value=max_index // 2)
