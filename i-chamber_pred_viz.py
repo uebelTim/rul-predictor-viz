@@ -145,7 +145,7 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
 # ---------------------------------------------------------
 # 3. Structural Break Detector (Model Competition)
 # ---------------------------------------------------------
-def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_wins=2):
+def detect_structural_break(time_arr, sensor_arr, window=120, step=7, sustained_wins=2):
     """
     Detects a structural break by sliding a window across the data and comparing 
     the AIC score of a Linear Model vs. a Shifted Exponential Model.
