@@ -636,17 +636,31 @@ def main():
     max_rul = st.sidebar.number_input("Max RUL Cap (Days)", min_value=1, max_value=5000, value=365)
     
     st.sidebar.markdown("### 7. Variance Configuration")
-    use_dynamic_variance = st.sidebar.toggle("Use Dynamic Variance (Linear Fit)", value=True, help="If off, uses a static variance (the last recorded standard deviation) across the entire future curve.")
+    use_dynamic_variance = st.sidebar.toggle("Use Dynamic Variance (Linear Fit)", value=True, help="If off, uses a static variance (the last recorded standard deviation) across the entire future curve. If on, fits a linear trend to the rolling standard deviation of residuals and extrapolates it into the future for a more adaptive confidence band.")
 
     # NEW: Model Competition UI Parameters
+    # NEW: Model Competition UI Parameters
     st.sidebar.markdown("### 8. Structural Break (Model Competition)")
-    break_window = st.sidebar.number_input("Evaluation Window (Days)", min_value=10, max_value=200, value=60, step=10)
+    
+    break_window = st.sidebar.number_input(
+        "Evaluation Window (Days)", 
+        min_value=10, max_value=200, value=60, step=10,
+        help="The amount of data analyzed in a single chunk to decide if the trend is linear or exponential. A wider window is more stable against noise, but might detect the break slightly later."
+    )
     
     col_s, col_t = st.sidebar.columns(2)
     with col_s:
-        break_step = st.number_input("Step Size (Days)", min_value=1, max_value=30, value=7, step=1)
+        break_step = st.number_input(
+            "Step Size (Days)", 
+            min_value=1, max_value=30, value=7, step=1,
+            help="How many days the algorithm jumps forward after each check. Smaller steps give exact dates but take longer to calculate. 7 days checks once a week."
+        )
     with col_t:
-        break_sustained = st.number_input("Sustained Wins", min_value=1, max_value=10, value=2, step=1)
+        break_sustained = st.number_input(
+            "Sustained Wins", 
+            min_value=1, max_value=10, value=2, step=1,
+            help="The failsafe. The exponential model must beat the linear model this many consecutive times to officially trigger the 'Structural Break' alarm. Prevents false positives from random data spikes."
+        )
 
     # 1. Load Data
     sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(uploaded_file, col=selected_col)
