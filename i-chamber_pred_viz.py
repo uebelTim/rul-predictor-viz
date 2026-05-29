@@ -66,8 +66,18 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
     t_max = np.max(time_arr)
     time_norm = time_arr / t_max if t_max > 0 else time_arr
     
-    y_min = np.min(sensor_arr)
-    y_max = np.max(sensor_arr)
+    # -------------------------------------------------------------
+    # 2. THE FIX: Create a Boolean mask of valid (non-NaN) data
+    # -------------------------------------------------------------
+    valid_mask = ~np.isnan(sensor_arr)
+    if valid_mask.sum() < 10:  # If we have less than 10 valid points, abort
+        return {}, {}
+        
+    t_fit = time_norm[valid_mask]
+    y_fit = sensor_arr[valid_mask]
+    
+    y_min = np.min(y_fit)
+    y_max = np.max(y_fit)
     y_range = y_max - y_min
     
     models_config = {
@@ -115,13 +125,16 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
     
     for name, config in models_config.items():
         try:
-            params, _ = curve_fit(config['func'], time_norm, sensor_arr, p0=config['p0'], bounds=config['bounds'], maxfev=10000)
-            preds = config['func'](time_norm, *params)
+            # Feed ONLY the masked arrays into curve_fit
+            params, _ = curve_fit(config['func'], t_fit, y_fit, p0=config['p0'], bounds=config['bounds'], maxfev=10000)
             
-            if eval_window is not None and eval_window < len(sensor_arr):
-                mse = mean_squared_error(sensor_arr[-eval_window:], preds[-eval_window:])
+            # Predict only on the valid time steps
+            preds = config['func'](t_fit, *params)
+            
+            if eval_window is not None and eval_window < len(y_fit):
+                mse = mean_squared_error(y_fit[-eval_window:], preds[-eval_window:])
             else:
-                mse = mean_squared_error(sensor_arr, preds)
+                mse = mean_squared_error(y_fit, preds)
                 
             results[name] = {'params': params, 'mse': mse, 'func': config['func']}
         except Exception as e:
@@ -145,48 +158,54 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
 # ---------------------------------------------------------
 # 3. Structural Break Detector (Model Competition)
 # ---------------------------------------------------------
-def detect_structural_break(time_arr, sensor_arr, window=120, step=7, sustained_wins=2):
-    """
-    Detects a structural break by sliding a window across the data and comparing 
-    the AIC score of a Linear Model vs. a Shifted Exponential Model.
-    """
+def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_wins=2):
     time_arr = np.asarray(time_arr, dtype=float)
     sensor_arr = np.asarray(sensor_arr, dtype=float)
     
     if len(sensor_arr) < window:
         return None, None
 
-    # Lightly smooth the max envelope for stable curve fitting
-    smooth_sensor = pd.Series(sensor_arr).ewm(span=5, adjust=False).mean().values
+    # Use ignore_na=True for smooth bridging
+    smooth_sensor = pd.Series(sensor_arr).ewm(span=5, adjust=False, ignore_na=True).mean().values
 
     consecutive_exp_wins = 0
     trigger_idx = None
     
-    # Slide the window across the array
     for i in range(0, len(smooth_sensor) - window + 1, step):
-        t_win = time_arr[i : i+window]
-        y_win = smooth_sensor[i : i+window]
+        t_win_raw = time_arr[i : i+window]
+        y_win_raw = smooth_sensor[i : i+window]
         
-        # Local Normalization for successful curve_fit convergence
+        # -------------------------------------------------------------
+        # 4. THE FIX: Apply local mask to the current window
+        # -------------------------------------------------------------
+        valid = ~np.isnan(y_win_raw)
+        
+        # If less than 10 valid days exist in this 60-day window, skip it
+        if valid.sum() < 10:
+            consecutive_exp_wins = 0
+            continue 
+            
+        t_win = t_win_raw[valid]
+        y_win = y_win_raw[valid]
+        
+        # Local Normalization
         t_min, t_max = t_win[0], t_win[-1]
         t_norm = (t_win - t_min) / (t_max - t_min) if t_max > t_min else t_win - t_min
         
         y_min, y_max = np.min(y_win), np.max(y_win)
         y_range = y_max - y_min + 1e-5
-        
         n = len(y_win)
         
-        # --- Fit Linear Model (2 Parameters) ---
+        # --- Fit Linear Model ---
         try:
             popt_lin, _ = curve_fit(linear_model, t_norm, y_win, p0=[y_range, y_min], maxfev=2000)
             preds_lin = linear_model(t_norm, *popt_lin)
             mse_lin = mean_squared_error(y_win, preds_lin)
-            # Akaike Information Criterion (AIC)
             aic_lin = n * np.log(mse_lin + 1e-10) + 2 * 2 
         except:
             aic_lin = float('inf')
 
-        # --- Fit Exponential Model (4 Parameters) ---
+        # --- Fit Exponential Model ---
         try:
             bounds_exp = ([1e-5, 0.01, 0.0, y_min - 0.2], [y_range * 5.0, 50.0, 1.0, y_max + 0.2])
             p0_exp = [y_range * 0.1, 5.0, 0.5, y_min]
@@ -194,18 +213,14 @@ def detect_structural_break(time_arr, sensor_arr, window=120, step=7, sustained_
             popt_exp, _ = curve_fit(shifted_exponential_model, t_norm, y_win, p0=p0_exp, bounds=bounds_exp, maxfev=2000)
             preds_exp = shifted_exponential_model(t_norm, *popt_exp)
             mse_exp = mean_squared_error(y_win, preds_exp)
-            # Akaike Information Criterion (AIC)
             aic_exp = n * np.log(mse_exp + 1e-10) + 2 * 4 
         except:
             aic_exp = float('inf')
 
-        # --- Evaluate the Winner ---
-        # Require the Exponential model to definitively beat the Linear model
-        # (AIC diff > 2.0 is the standard statistical threshold for strong evidence)
+        # --- Evaluate Winner ---
         if aic_exp < aic_lin - 2.0:
             consecutive_exp_wins += 1
             if consecutive_exp_wins >= sustained_wins:
-                # The break is defined as the start of the window where it FIRST won
                 first_win_idx = i - (sustained_wins - 1) * step
                 trigger_idx = first_win_idx
                 break
@@ -262,12 +277,21 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
         except Exception:
             pass
 
+    # -------------------------------------------------------------
+    # 3. THE FIX: Protect curve_fit with masks
+    # -------------------------------------------------------------
+    valid_mask = ~np.isnan(sensor_arr)
+    t_fit = time_norm[valid_mask]
+    y_fit = sensor_arr[valid_mask]
+
     try:
-        params, _ = curve_fit(config['func'], time_norm, sensor_arr, p0=config['p0'], bounds=config['bounds'], maxfev=10000)
+        # Fit on valid data only
+        params, _ = curve_fit(config['func'], t_fit, y_fit, p0=config['p0'], bounds=config['bounds'], maxfev=10000)
     except Exception as e:
         print(f"Error: {model_choice} model failed to converge. {e}")
         return pd.Series(np.nan, index=orig_index), pd.DataFrame()
 
+    # Generate predictions across the FULL time array (bridging the gaps visually)
     fitted_series = pd.Series(config['func'](time_norm, *params), index=orig_index, name=f"{model_choice}_Fit")
     residuals_series = pd.Series(sensor_raw - fitted_series, index=orig_index, name=f"{model_choice}_Residuals")
     
@@ -277,10 +301,11 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     rolling_std = residuals_series.rolling(window=20, min_periods=1).std()
     rolling_std = rolling_std.bfill().fillna(0) 
 
-    valid_mask = ~np.isnan(rolling_std)
+    valid_std_mask = ~np.isnan(rolling_std)
     
-    if use_dynamic_variance and valid_mask.sum() > 1:
-        std_slope, std_intercept = np.polyfit(time_norm[valid_mask], rolling_std[valid_mask], 1)
+    if use_dynamic_variance and valid_std_mask.sum() > 1:
+        # Ensure we only use valid std calculations for the polyfit
+        std_slope, std_intercept = np.polyfit(time_norm[valid_std_mask], rolling_std[valid_std_mask], 1)
     else:
         std_slope, std_intercept = 0.0, rolling_std.iloc[-1]
 
@@ -571,8 +596,13 @@ def load_my_sensor_data(file_obj, col='32'):
     column_names.extend(cols)
     
     df_select = df[cols]
-    df_select = df_select.interpolate(method='time')
-    df_select = df_select.ffill().bfill()
+    
+    # -------------------------------------------------------------
+    # 1. THE FIX: Remove massive interpolation. 
+    # We only interpolate tiny gaps (e.g., 1 missing 4h point).
+    # Massive gaps remain as pure NaN.
+    # -------------------------------------------------------------
+    df_select = df_select.interpolate(method='time', limit=1) 
     
     try:
         df_select = filter_outliers_quantile(df_select, factor=3)
@@ -582,15 +612,17 @@ def load_my_sensor_data(file_obj, col='32'):
     df_defect = df_select
     window = int(1*24/4) 
     
-    df_defect[f'{col}_max'] = df_defect[f'{col}'].rolling(window=window*5).max()
-    df_defect[f'{col}_max_ema'] = df_defect[f'{col}_max'].ewm(span=window*5, adjust=False).mean()
+    # ADD min_periods=1 so the rolling math doesn't vanish when it hits a NaN
+    df_defect[f'{col}_max'] = df_defect[f'{col}'].rolling(window=window*5, min_periods=1).max()
+    
+    # Use ignore_na=True so the EMA ignores the gaps instead of breaking
+    df_defect[f'{col}_max_ema'] = df_defect[f'{col}_max'].ewm(span=window*5, adjust=False, ignore_na=True).mean()
 
     df_defect_daily = df_defect.resample('D').mean()
-    df_defect_daily = df_defect_daily.bfill().ffill()
+    # DO NOT use .bfill().ffill() here anymore! Let the NaNs exist.
     df_defect_daily['elapsed_days'] = (df_defect_daily.index - df_defect_daily.index.min()).days
     
     return df_defect_daily[f'{col}_max_ema'], df_defect_daily[f'{col}_max'], df_defect_daily['elapsed_days']
-
 
 # ---------------------------------------------------------
 # 6. The Main UI Function
