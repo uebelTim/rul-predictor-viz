@@ -143,61 +143,80 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
 
 
 # ---------------------------------------------------------
-# 3. Structural Break Detector (Rolling Slope / Velocity)
+# 3. Structural Break Detector (Model Competition)
 # ---------------------------------------------------------
-def detect_structural_break(time_arr, sensor_arr, window=21, threshold_pct=5.0, sustained_points=3):
+def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_wins=2):
     """
-    Detects a structural break by tracking the rolling linear slope (velocity) of the data.
-    Triggers when the upward slope is steep enough to cover 'threshold_pct' of the 
-    total data range within a standardized 30-day period, sustained over several days.
+    Detects a structural break by sliding a window across the data and comparing 
+    the AIC score of a Linear Model vs. a Shifted Exponential Model.
     """
     time_arr = np.asarray(time_arr, dtype=float)
     sensor_arr = np.asarray(sensor_arr, dtype=float)
     
-    if len(sensor_arr) < window + sustained_points:
+    if len(sensor_arr) < window:
         return None, None
 
-    # 1. Lightly smooth the max envelope to prevent single-day noise from warping the slope
+    # Lightly smooth the max envelope for stable curve fitting
     smooth_sensor = pd.Series(sensor_arr).ewm(span=5, adjust=False).mean().values
-    
-    # 2. Determine the physical scale of the data
-    data_range = np.max(sensor_arr) - np.min(sensor_arr)
-    if data_range == 0:
-        return None, None
-        
-    # Calculate the absolute slope required to trigger a break.
-    # (e.g., slope needed to rise 5% of the total range over 30 days)
-    required_slope = (data_range * (threshold_pct / 100.0)) / 30.0
-    
-    # 3. Calculate rolling slopes
-    slopes = np.zeros(len(smooth_sensor))
-    for i in range(window, len(smooth_sensor)):
-        t_win = time_arr[i-window : i]
-        y_win = smooth_sensor[i-window : i]
-        
-        # Calculate slope (m) for this window
-        m, _ = np.polyfit(t_win, y_win, 1)
-        slopes[i] = m
 
-    # 4. Find where the slope exceeds the threshold for 'sustained_points' consecutive days
-    consecutive_count = 0
-    break_idx = None
+    consecutive_exp_wins = 0
+    trigger_idx = None
     
-    # Start looking only after the first window has fully formed
-    for i in range(window, len(slopes)):
-        if slopes[i] >= required_slope:
-            consecutive_count += 1
-            if consecutive_count >= sustained_points:
-                # The actual break started 'sustained_points' ago when it first crossed
-                break_idx = i - sustained_points + 1
+    # Slide the window across the array
+    for i in range(0, len(smooth_sensor) - window + 1, step):
+        t_win = time_arr[i : i+window]
+        y_win = smooth_sensor[i : i+window]
+        
+        # Local Normalization for successful curve_fit convergence
+        t_min, t_max = t_win[0], t_win[-1]
+        t_norm = (t_win - t_min) / (t_max - t_min) if t_max > t_min else t_win - t_min
+        
+        y_min, y_max = np.min(y_win), np.max(y_win)
+        y_range = y_max - y_min + 1e-5
+        
+        n = len(y_win)
+        
+        # --- Fit Linear Model (2 Parameters) ---
+        try:
+            popt_lin, _ = curve_fit(linear_model, t_norm, y_win, p0=[y_range, y_min], maxfev=2000)
+            preds_lin = linear_model(t_norm, *popt_lin)
+            mse_lin = mean_squared_error(y_win, preds_lin)
+            # Akaike Information Criterion (AIC)
+            aic_lin = n * np.log(mse_lin + 1e-10) + 2 * 2 
+        except:
+            aic_lin = float('inf')
+
+        # --- Fit Exponential Model (4 Parameters) ---
+        try:
+            bounds_exp = ([1e-5, 0.01, 0.0, y_min - 0.2], [y_range * 5.0, 50.0, 1.0, y_max + 0.2])
+            p0_exp = [y_range * 0.1, 5.0, 0.5, y_min]
+            
+            popt_exp, _ = curve_fit(shifted_exponential_model, t_norm, y_win, p0=p0_exp, bounds=bounds_exp, maxfev=2000)
+            preds_exp = shifted_exponential_model(t_norm, *popt_exp)
+            mse_exp = mean_squared_error(y_win, preds_exp)
+            # Akaike Information Criterion (AIC)
+            aic_exp = n * np.log(mse_exp + 1e-10) + 2 * 4 
+        except:
+            aic_exp = float('inf')
+
+        # --- Evaluate the Winner ---
+        # Require the Exponential model to definitively beat the Linear model
+        # (AIC diff > 2.0 is the standard statistical threshold for strong evidence)
+        if aic_exp < aic_lin - 2.0:
+            consecutive_exp_wins += 1
+            if consecutive_exp_wins >= sustained_wins:
+                # The break is defined as the start of the window where it FIRST won
+                first_win_idx = i - (sustained_wins - 1) * step
+                trigger_idx = first_win_idx
                 break
         else:
-            consecutive_count = 0 # Reset if the slope dips back down
-            
-    if break_idx is not None:
-        return break_idx, time_arr[break_idx]
+            consecutive_exp_wins = 0
+
+    if trigger_idx is not None:
+        return trigger_idx, time_arr[trigger_idx]
         
     return None, None
+
 
 # ---------------------------------------------------------
 # 4. Dynamic/Static Variance & RUL Plotting
@@ -535,35 +554,6 @@ def get_available_channels(file_obj):
 
 
 @st.cache_data
-def calculate_global_baseline_slope(file_obj, baseline_pct=0.20):
-    """
-    Calculates the universal 'healthy' slope by averaging the first 20% 
-    of all available columns (since they are identical component types).
-    """
-    file_obj.seek(0)
-    df = pd.read_csv(file_obj, parse_dates=['DateTime'])
-    df.set_index('DateTime', inplace=True)
-    df = df[~df.index.duplicated(keep='first')]
-    
-    df_daily = df.resample('D').mean(numeric_only=True)
-    
-    cols = [c for c in df_daily.columns if 'Error' not in c and c != 'Thermo_Valve_Temperature_DeviationPct']
-    global_mean = df_daily[cols].mean(axis=1).bfill().ffill()
-    
-    n_base = max(5, int(len(global_mean) * baseline_pct))
-    y_base = global_mean.iloc[:n_base].values
-    
-    t_base = (global_mean.index[:n_base] - global_mean.index[0]).days.values
-    
-    if len(t_base) > 1:
-        slope, _ = np.polyfit(t_base, y_base, 1)
-    else:
-        slope = 0.0
-        
-    return slope
-
-
-@st.cache_data
 def load_my_sensor_data(file_obj, col='32'):
     freq = '4h'
     column_names=[]
@@ -600,6 +590,7 @@ def load_my_sensor_data(file_obj, col='32'):
     df_defect_daily['elapsed_days'] = (df_defect_daily.index - df_defect_daily.index.min()).days
     
     return df_defect_daily[f'{col}_max_ema'], df_defect_daily[f'{col}_max'], df_defect_daily['elapsed_days']
+
 
 # ---------------------------------------------------------
 # 6. The Main UI Function
@@ -647,27 +638,26 @@ def main():
     st.sidebar.markdown("### 7. Variance Configuration")
     use_dynamic_variance = st.sidebar.toggle("Use Dynamic Variance (Linear Fit)", value=True, help="If off, uses a static variance (the last recorded standard deviation) across the entire future curve.")
 
-    # NEW: Rolling Slope UI Parameters
-    st.sidebar.markdown("### 8. Structural Break (Rolling Slope)")
-    break_window = st.sidebar.number_input("Rolling Window Size", min_value=7, max_value=90, value=21, step=1, help="Days to look back to calculate the current trend slope.")
+    # NEW: Model Competition UI Parameters
+    st.sidebar.markdown("### 8. Structural Break (Model Competition)")
+    break_window = st.sidebar.number_input("Evaluation Window (Days)", min_value=10, max_value=200, value=60, step=10)
     
     col_s, col_t = st.sidebar.columns(2)
     with col_s:
-        slope_thresh = st.number_input("Severity Threshold (%)", min_value=0.5, max_value=50.0, value=5.0, step=0.5, help="Slope required to rise this % of total range in 30 days.")
+        break_step = st.number_input("Step Size (Days)", min_value=1, max_value=30, value=7, step=1)
     with col_t:
-        break_sustained = st.number_input("Sustained Days", min_value=1, max_value=14, value=3, step=1, help="Consecutive days the slope must stay high to trigger the break.")
+        break_sustained = st.number_input("Sustained Wins", min_value=1, max_value=10, value=2, step=1)
 
     # 1. Load Data
     sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(uploaded_file, col=selected_col)
     
     # 2. GLOBAL STRUCTURAL BREAK DETECTION
-    # Runs exactly once on the ENTIRE dataset to find the true historical break.
     break_idx, break_time = detect_structural_break(
         time_arr, 
         sensor_arr_smooth, 
         window=break_window,
-        threshold_pct=slope_thresh,
-        sustained_points=break_sustained
+        step=break_step,
+        sustained_wins=break_sustained
     )
 
     max_index = len(time_arr) - 1
@@ -712,7 +702,7 @@ def main():
             title_addon=f"| Channel: {selected_col} | Cutoff: {cutoff_idx}",
             max_rul_display=max_rul,
             use_dynamic_variance=use_dynamic_variance,
-            break_time_raw=break_time # Pass the globally found break_time here
+            break_time_raw=break_time
         )
         
         plot_col, side_metrics_col = st.columns([3, 1])
