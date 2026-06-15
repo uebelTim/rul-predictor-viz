@@ -6,28 +6,43 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from streamlit_sortables import sort_items 
-#import diagnostic_utils as du 
 
 def filter_outliers_quantile(df, factor=1.5, keep_nans=True):
+    """
+    Filter out outliers from a DataFrame using the Interquartile Range (IQR) method.
+    'factor' is typically 1.5 for outliers and 3.0 for extreme outliers.
+    'keep_nans' if True, preserves original NaN positions after interpolation.
+    """
+    # Force numeric types
     df_numeric = df.apply(pd.to_numeric, errors='coerce')
+
+    # Snapshot original NaN positions before any processing
     original_nans = df_numeric.isna()
-    
+
+    # Calculate quartiles and IQR
     Q1 = df_numeric.quantile(0.25)
     Q3 = df_numeric.quantile(0.75)
     IQR = Q3 - Q1
+
+    # Define bounds
     lower_bound = Q1 - (factor * IQR)
     upper_bound = Q3 + (factor * IQR)
-    
+
+    # Replace outliers with NaN
     mask = (df_numeric >= lower_bound) & (df_numeric <= upper_bound)
     df_filtered = df_numeric.where(mask, np.nan)
+
+    # Interpolate over outlier positions (not original NaNs)
     df_filtered = df_filtered.interpolate(method='linear', limit_direction='both')
-    
+
+    # Interpolate over axis=1 if still NaN values
     if df_filtered.isnull().values.any():
         df_filtered = df_filtered.interpolate(method='linear', axis=1, limit_direction='both')
-        
+
+    # Restore original NaN positions
     if keep_nans:
         df_filtered[original_nans] = np.nan
-        
+
     return df_filtered
 
 # ---------------------------------------------------------
@@ -66,11 +81,8 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
     t_max = np.max(time_arr)
     time_norm = time_arr / t_max if t_max > 0 else time_arr
     
-    # -------------------------------------------------------------
-    # 2. THE FIX: Create a Boolean mask of valid (non-NaN) data
-    # -------------------------------------------------------------
     valid_mask = ~np.isnan(sensor_arr)
-    if valid_mask.sum() < 10:  # If we have less than 10 valid points, abort
+    if valid_mask.sum() < 10:  
         return {}, {}
         
     t_fit = time_norm[valid_mask]
@@ -125,10 +137,7 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
     
     for name, config in models_config.items():
         try:
-            # Feed ONLY the masked arrays into curve_fit
             params, _ = curve_fit(config['func'], t_fit, y_fit, p0=config['p0'], bounds=config['bounds'], maxfev=10000)
-            
-            # Predict only on the valid time steps
             preds = config['func'](t_fit, *params)
             
             if eval_window is not None and eval_window < len(y_fit):
@@ -158,7 +167,11 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
 # ---------------------------------------------------------
 # 3. Structural Break Detector (Model Competition)
 # ---------------------------------------------------------
-def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_wins=5):
+def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_wins=2):
+    """
+    Detects a structural break by sliding a window across the data and comparing 
+    the AIC score of a Linear Model vs. a Shifted Exponential Model.
+    """
     time_arr = np.asarray(time_arr, dtype=float)
     sensor_arr = np.asarray(sensor_arr, dtype=float)
     
@@ -175,9 +188,6 @@ def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_w
         t_win_raw = time_arr[i : i+window]
         y_win_raw = smooth_sensor[i : i+window]
         
-        # -------------------------------------------------------------
-        # 4. THE FIX: Apply local mask to the current window
-        # -------------------------------------------------------------
         valid = ~np.isnan(y_win_raw)
         
         # If less than 10 valid days exist in this 60-day window, skip it
@@ -254,13 +264,20 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     t_max = raw_current_time if raw_current_time > 0 else 1.0
     time_norm = time_arr / t_max
     
-    y_min = np.min(sensor_arr)
-    y_max = np.max(sensor_arr)
-    y_range = y_max - y_min
-    
     to_hours = {"Seconds": 1/3600, "Minutes": 1/60, "Hours": 1.0, "Days": 24.0, "2H": 2.0, "8H": 8.0}
     conversion_factor = to_hours[input_time_unit] / to_hours[target_time_unit]
     
+    valid_mask = ~np.isnan(sensor_arr)
+    t_fit = time_norm[valid_mask]
+    y_fit = sensor_arr[valid_mask]
+
+    if len(y_fit) == 0:
+        return go.Figure(), pd.Series(), pd.DataFrame()
+
+    y_min = np.min(y_fit)
+    y_max = np.max(y_fit)
+    y_range = y_max - y_min
+
     models_config = {
         'Rational': {'func': rational_model, 'p0': [y_range, 0.5, y_min], 'bounds': ([0.0, 1e-3, y_min - 0.2], [np.inf, np.inf, y_min + 0.2])},
         'Arctangent': {'func': arctan_model, 'p0': [y_range * 1.1, 20.0, 0.5, y_min], 'bounds': ([y_range * 0.5, 0.1, 0.0, y_min - 0.2], [max(2.0, y_range * 2.2), 500.0, 1.0, y_min + 0.2])},
@@ -277,21 +294,12 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
         except Exception:
             pass
 
-    # -------------------------------------------------------------
-    # 3. THE FIX: Protect curve_fit with masks
-    # -------------------------------------------------------------
-    valid_mask = ~np.isnan(sensor_arr)
-    t_fit = time_norm[valid_mask]
-    y_fit = sensor_arr[valid_mask]
-
     try:
-        # Fit on valid data only
         params, _ = curve_fit(config['func'], t_fit, y_fit, p0=config['p0'], bounds=config['bounds'], maxfev=10000)
     except Exception as e:
         print(f"Error: {model_choice} model failed to converge. {e}")
         return pd.Series(np.nan, index=orig_index), pd.DataFrame()
 
-    # Generate predictions across the FULL time array (bridging the gaps visually)
     fitted_series = pd.Series(config['func'](time_norm, *params), index=orig_index, name=f"{model_choice}_Fit")
     residuals_series = pd.Series(sensor_raw - fitted_series, index=orig_index, name=f"{model_choice}_Residuals")
     
@@ -304,7 +312,6 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     valid_std_mask = ~np.isnan(rolling_std)
     
     if use_dynamic_variance and valid_std_mask.sum() > 1:
-        # Ensure we only use valid std calculations for the polyfit
         std_slope, std_intercept = np.polyfit(time_norm[valid_std_mask], rolling_std[valid_std_mask], 1)
     else:
         std_slope, std_intercept = 0.0, rolling_std.iloc[-1]
@@ -522,7 +529,7 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
         break_time_converted = break_time_raw * conversion_factor
         fig.add_vline(x=break_time_converted, line_width=2, line_dash="dash", line_color="orange")
         fig.add_annotation(
-            x=break_time_converted, y=np.max(sensor_arr) * 1.05 if np.max(sensor_arr) > 0 else 0,
+            x=break_time_converted, y=y_max * 1.05 if y_max > 0 else 0,
             text="⚠️ Structural Break", showarrow=False,
             yshift=10, font=dict(color="orange", size=12)
         )
@@ -532,8 +539,8 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
 
     # Axis Limits
     max_target = max(thresholds) if thresholds is not None else 0
-    absolute_y_max = max(np.max(sensor_arr), max_target)
-    absolute_y_min = min(0, np.min(sensor_arr))
+    absolute_y_max = max(y_max, max_target)
+    absolute_y_min = min(0, y_min)
     y_padding = (absolute_y_max - absolute_y_min) * 0.15
     y_upper_limit = absolute_y_max + y_padding
     y_lower_limit = absolute_y_min - (y_padding if absolute_y_min < 0 else 0)
@@ -579,7 +586,32 @@ def get_available_channels(file_obj):
 
 
 @st.cache_data
-def load_my_sensor_data(file_obj, col='32'):
+def calculate_global_baseline_slope(file_obj, baseline_pct=0.20):
+    file_obj.seek(0)
+    df = pd.read_csv(file_obj, parse_dates=['DateTime'])
+    df.set_index('DateTime', inplace=True)
+    df = df[~df.index.duplicated(keep='first')]
+    
+    df_daily = df.resample('D').mean(numeric_only=True)
+    
+    cols = [c for c in df_daily.columns if 'Error' not in c and c != 'Thermo_Valve_Temperature_DeviationPct']
+    global_mean = df_daily[cols].mean(axis=1).bfill().ffill()
+    
+    n_base = max(5, int(len(global_mean) * baseline_pct))
+    y_base = global_mean.iloc[:n_base].values
+    
+    t_base = (global_mean.index[:n_base] - global_mean.index[0]).days.values
+    
+    if len(t_base) > 1:
+        slope, _ = np.polyfit(t_base, y_base, 1)
+    else:
+        slope = 0.0
+        
+    return slope
+
+
+@st.cache_data
+def load_my_sensor_data(file_obj, col='32', outlier_factor=3.0):
     freq = '4h'
     column_names=[]
     
@@ -596,33 +628,22 @@ def load_my_sensor_data(file_obj, col='32'):
     column_names.extend(cols)
     
     df_select = df[cols]
+    df_select = df_select.interpolate(method='time', limit=1)
     
-    # -------------------------------------------------------------
-    # 1. THE FIX: Remove massive interpolation. 
-    # We only interpolate tiny gaps (e.g., 1 missing 4h point).
-    # Massive gaps remain as pure NaN.
-    # -------------------------------------------------------------
-    df_select = df_select.interpolate(method='time', limit=1) 
-    
-    try:
-        df_select = filter_outliers_quantile(df_select, factor=3)
-    except NameError:
-        pass 
+    # Run the outlier filter with the user's dynamic factor
+    df_select = filter_outliers_quantile(df_select, factor=outlier_factor)
         
     df_defect = df_select
     window = int(1*24/4) 
     
-    # ADD min_periods=1 so the rolling math doesn't vanish when it hits a NaN
     df_defect[f'{col}_max'] = df_defect[f'{col}'].rolling(window=window*5, min_periods=1).max()
-    
-    # Use ignore_na=True so the EMA ignores the gaps instead of breaking
     df_defect[f'{col}_max_ema'] = df_defect[f'{col}_max'].ewm(span=window*5, adjust=False, ignore_na=True).mean()
 
     df_defect_daily = df_defect.resample('D').mean()
-    # DO NOT use .bfill().ffill() here anymore! Let the NaNs exist.
     df_defect_daily['elapsed_days'] = (df_defect_daily.index - df_defect_daily.index.min()).days
     
     return df_defect_daily[f'{col}_max_ema'], df_defect_daily[f'{col}_max'], df_defect_daily['elapsed_days']
+
 
 # ---------------------------------------------------------
 # 6. The Main UI Function
@@ -664,20 +685,24 @@ def main():
         sorted_models = sort_items(AVAILABLE_MODELS, direction='vertical')
         user_priority_dict = {model: rank for rank, model in enumerate(sorted_models, start=1)}
 
-    st.sidebar.markdown("### 6. Display Limits")
-    max_rul = st.sidebar.number_input("Max RUL Cap (Days)", min_value=1, max_value=5000, value=365)
+    # NEW: Replaced Display Limits with Outlier Filtering slider
+    st.sidebar.markdown("### 6. Outlier Filtering")
+    outlier_factor = st.sidebar.slider(
+        "IQR Outlier Factor", 
+        min_value=0.5, max_value=10.0, value=3.0, step=0.1, 
+        help="Multiplier for the Interquartile Range. Lower values aggressively filter out peaks, higher values keep them intact. 1.5 is standard, 3.0 is for extreme outliers."
+    )
+    # Lock max_rul globally under the hood to ensure formatting stays clean
+    max_rul = 365 
     
     st.sidebar.markdown("### 7. Variance Configuration")
-    use_dynamic_variance = st.sidebar.toggle("Use Dynamic Variance (Linear Fit)", value=True, help="If off, uses a static variance (the last recorded standard deviation) across the entire future curve. If on, fits a linear trend to the rolling standard deviation of residuals and extrapolates it into the future for a more adaptive confidence band.")
+    use_dynamic_variance = st.sidebar.toggle("Use Dynamic Variance (Linear Fit)", value=True, help="If off, uses a static variance (the last recorded standard deviation) across the entire future curve.")
 
-    # NEW: Model Competition UI Parameters
-    # NEW: Model Competition UI Parameters
     st.sidebar.markdown("### 8. Structural Break (Model Competition)")
-    
     break_window = st.sidebar.number_input(
         "Evaluation Window (Days)", 
         min_value=10, max_value=200, value=60, step=10,
-        help="The amount of data analyzed in a single chunk to decide if the trend is linear or exponential. A wider window is more stable against noise."
+        help="The amount of data analyzed in a single chunk to decide if the trend is linear or exponential. A wider window is more stable against noise, but might detect the break slightly later."
     )
     
     col_s, col_t = st.sidebar.columns(2)
@@ -690,12 +715,12 @@ def main():
     with col_t:
         break_sustained = st.number_input(
             "Sustained Wins", 
-            min_value=1, max_value=10, value=5, step=1,
-            help="The exponential model must beat the linear model this many consecutive times to officially trigger the 'Structural Break' alarm. Prevents false positives from random data spikes."
+            min_value=1, max_value=10, value=2, step=1,
+            help="The failsafe. The exponential model must beat the linear model this many consecutive times to officially trigger the 'Structural Break' alarm. Prevents false positives from random data spikes."
         )
 
-    # 1. Load Data
-    sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(uploaded_file, col=selected_col)
+    # 1. Load Data (Now passing the outlier factor)
+    sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(uploaded_file, col=selected_col, outlier_factor=outlier_factor)
     
     # 2. GLOBAL STRUCTURAL BREAK DETECTION
     break_idx, break_time = detect_structural_break(
@@ -707,7 +732,7 @@ def main():
     )
 
     max_index = len(time_arr) - 1
-    thresholds = [0.2, 1.0]
+    thresholds = [0.2, 0.5, 1.0]
 
     st.markdown("### Time Navigation")
     cutoff_idx = st.slider("Select the Current Time Point (Data Cutoff)", min_value=10, max_value=max_index, value=max_index // 2)
