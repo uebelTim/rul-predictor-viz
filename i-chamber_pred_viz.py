@@ -908,7 +908,8 @@ def generate_simulation_dashboards(raw_df):
                 yaxis_title=f"Predicted RUL (Days, capped @ {RUL_HORIZON})",
                 xaxis=dict(range=[0, x_view_max]),
                 yaxis=dict(range=[0, y_view_max]),
-                height=600,  # taller window
+                height=800,  # taller window
+                width=1200,
                 template="plotly_white",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
