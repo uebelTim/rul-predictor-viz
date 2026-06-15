@@ -4,6 +4,7 @@ import math
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.express as px
 import streamlit as st
 from streamlit_sortables import sort_items 
 
@@ -741,7 +742,6 @@ def generate_simulation_dashboards(raw_df):
     df.loc[~actual_safe & pred_safe, 'Status'] = 'False Negative'
 
     # Dynamic Bias Score (Scales exactly to the current Action Window)
-    # -Action Window = 0.0 (Too Early) | Perfect = 0.5 | +Action Window = 1.0 (Too Late)
     error = df['Nominal_RUL'] - df['Actual_RUL']
     df['Bias_Score'] = np.clip((error + action_window) / (action_window * 2), 0.0, 1.0)
 
@@ -751,9 +751,20 @@ def generate_simulation_dashboards(raw_df):
     
     status_map = {"True Negative": 0, "False Positive": 1, "True Positive": 2, "False Negative": 3}
     df['Status_Code'] = df['Status'].map(status_map)
-    
     df['Eval_Day_Rounded'] = df['Evaluation_Day'].round().astype(int)
-    pivot_df = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status_Code', aggfunc='first')
+    
+    # Format RULs for hover tooltips (Handling NaNs gracefully)
+    df['Hover_Pred'] = df['Nominal_RUL'].apply(lambda x: f"{x:.1f} Days" if pd.notna(x) else "Safe/Unknown")
+    df['Hover_Act'] = df['Actual_RUL'].apply(lambda x: f"{x:.1f} Days" if pd.notna(x) else "Never Breaches")
+    
+    # Create pivot tables for the Z-axis (Colors) and CustomData (Hover text)
+    pivot_status_code = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status_Code', aggfunc='first')
+    pivot_status_text = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status', aggfunc='first')
+    pivot_pred = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Pred', aggfunc='first')
+    pivot_act = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Act', aggfunc='first')
+    
+    # Stack the hover data together
+    customdata = np.dstack((pivot_status_text.values, pivot_pred.values, pivot_act.values))
     
     colorscale = [
         [0.0, '#E8F5E9'], # 0: True Negative (Light Green)
@@ -762,20 +773,39 @@ def generate_simulation_dashboards(raw_df):
         [1.0, '#F44336']   # 3: False Negative (Red)
     ]
 
-    fig_a = go.Figure(data=go.Heatmap(
-        z=pivot_df.values,
-        x=pivot_df.columns,
-        y=pivot_df.index,
+    fig_a = go.Figure()
+    
+    # Add the main Heatmap
+    fig_a.add_trace(go.Heatmap(
+        z=pivot_status_code.values,
+        x=pivot_status_code.columns,
+        y=pivot_status_code.index,
         colorscale=colorscale,
         zmin=0, zmax=3,
         showscale=False,
         hoverongaps=False,
-        customdata=df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status', aggfunc='first').values,
-        hovertemplate="Day: %{x}<br>Channel: %{y}<br>Result: %{customdata}<extra></extra>"
+        customdata=customdata,
+        hovertemplate="<b>Day:</b> %{x}<br><b>Channel:</b> %{y}<br><b>Result:</b> %{customdata[0]}<br><b>Predicted:</b> %{customdata[1]}<br><b>Actual:</b> %{customdata[2]}<extra></extra>"
     ))
+    
+    # Add "Dummy" invisible traces just to force Plotly to render a Legend
+    legend_items = [
+        ("True Negative (Safe)", '#E8F5E9'),
+        ("False Positive (Early Alarm)", '#FFB74D'),
+        ("True Positive (Good Catch)", '#4CAF50'),
+        ("False Negative (Missed Break)", '#F44336')
+    ]
+    for name, color in legend_items:
+        fig_a.add_trace(go.Scatter(
+            x=[None], y=[None], mode='markers',
+            marker=dict(size=15, color=color, symbol='square', line=dict(color='black', width=1)),
+            name=name
+        ))
+
     fig_a.update_layout(
         xaxis_title="Simulation Day", yaxis_title="Channel",
-        height=400, template="plotly_white", margin=dict(t=30, b=30)
+        height=450, template="plotly_white", margin=dict(t=30, b=30),
+        legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5, title=None)
     )
     st.plotly_chart(fig_a, use_container_width=True)
 
@@ -799,13 +829,14 @@ def generate_simulation_dashboards(raw_df):
             )
             # Perfect prediction diagonal & Action Window boundaries
             fig_b.add_trace(go.Scatter(x=[0, max_val], y=[0, max_val], mode='lines', name='Perfect Prediction', line=dict(color='black', dash='dash')))
-            fig_b.add_vline(x=action_window, line_width=1, line_dash="dot", line_color="gray")
+            fig_b.add_vline(x=action_window, line_width=1, line_dash="dot", line_color="gray", annotation_text="Action Window", annotation_position="top left")
             fig_b.add_hline(y=action_window, line_width=1, line_dash="dot", line_color="gray")
             
             fig_b.update_layout(
                 xaxis_title="Actual RUL (Days)", yaxis_title="Predicted RUL (Days)",
                 xaxis=dict(range=[0, max_val]), yaxis=dict(range=[0, max_val]),
-                height=500, template="plotly_white"
+                height=500, template="plotly_white",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
             st.plotly_chart(fig_b, use_container_width=True)
         else:
@@ -833,7 +864,6 @@ def generate_simulation_dashboards(raw_df):
             st.plotly_chart(fig_c, use_container_width=True)
         else:
             st.info("Not enough failure data to calculate bias scores.")
-            
             
 # ---------------------------------------------------------
 # NEW: The Second Page (Live Simulation)
