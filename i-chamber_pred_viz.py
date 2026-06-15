@@ -640,40 +640,57 @@ def main():
     selected_display = st.sidebar.selectbox("1. Select Data Channel", options=display_options)
     selected_col = selected_display.split(" ")[0]
 
-    window_size = st.sidebar.number_input("2. Window Size (Lookback)", min_value=10, max_value=5000, value=300, step=10)
-    eval_window = st.sidebar.number_input("3. MSE Eval Window (Last N points)", min_value=1, max_value=window_size, value=min(50, window_size), step=1)
+    window_size = st.sidebar.number_input(
+        "2. Window Size (Lookback Days)", 
+        min_value=10, max_value=5000, value=300, step=10,
+        help="The total number of trailing days used to calculate the predictive curves. A larger window provides more historical stability, while a shorter window reacts faster to recent changes."
+    )
+    
+    eval_window = st.sidebar.number_input(
+        "3. MSE Eval Window (Last N Days)", 
+        min_value=1, max_value=window_size, value=min(50, window_size), step=1,
+        help="The number of recent days used to score and rank the models. For example, setting this to 50 means the algorithm picks the model that best fits the last 50 days, even if it fits the older data poorly."
+    )
 
     st.sidebar.markdown("### 4. Model Override")
-    override_model = st.sidebar.toggle("Enable Manual Selection", value=False)
+    override_model = st.sidebar.toggle(
+        "Enable Manual Selection", value=False,
+        help="Forces the dashboard to plot a specific mathematical model, ignoring the algorithm's automatic recommendation."
+    )
     manual_model = st.sidebar.selectbox("Force specific model:", options=AVAILABLE_MODELS, disabled=not override_model)
 
     st.sidebar.markdown("### 5. Router Priority Ranking")
     with st.sidebar.expander("Configure Router Ranking", expanded=False):
+        st.caption("Drag and drop to set tie-breaker priority (Top = Highest Priority). Used when multiple models fit the data equally well.")
         sorted_models = sort_items(AVAILABLE_MODELS, direction='vertical')
         user_priority_dict = {model: rank for rank, model in enumerate(sorted_models, start=1)}
 
-    st.sidebar.markdown("### 6. Outlier Filtering")
+    st.sidebar.markdown("### 6. Outlier Filtering (Pre-Processing)")
     outlier_factor = st.sidebar.slider(
         "IQR Outlier Factor", 
         min_value=0.5, max_value=10.0, value=3.0, step=0.1, 
-        help="Multiplier for the Interquartile Range. Lower values aggressively filter out peaks, higher values keep them intact. 1.5 is standard, 3.0 is for extreme outliers."
+        help="How aggressively to flatten spikes in the raw data. 1.5 is standard statistical filtering; 3.0 only removes extreme, impossible anomalies."
     )
     outlier_window = st.sidebar.number_input(
-        "Rolling Window (Periods)", 
+        "Rolling Window (4h Periods)", 
         min_value=5, max_value=200, value=42, step=1,
-        help="Number of data points used to calculate the local IQR. At 4h intervals, 42 periods = 7 days. A smaller window tracks sudden baseline shifts better but might filter out valid normal operations."
+        help="NOTE: This filter cleans the raw data BEFORE it is compressed into daily averages. Because the raw data arrives in 4-hour intervals, setting this to 42 periods equals exactly 7 days of local context."
     )
+    
     # Lock max_rul globally under the hood to ensure formatting stays clean
     max_rul = 365 
     
     st.sidebar.markdown("### 7. Variance Configuration")
-    use_dynamic_variance = st.sidebar.toggle("Use Dynamic Variance (Linear Fit)", value=True, help="If off, uses a static variance (the last recorded standard deviation) across the entire future curve.")
+    use_dynamic_variance = st.sidebar.toggle(
+        "Use Dynamic Variance (Linear Fit)", value=True, 
+        help="ON: The confidence bands widen over time as the machine degrades (Highly realistic). OFF: The bands stay parallel to the nominal fit using the last known standard deviation."
+    )
 
     st.sidebar.markdown("### 8. Structural Break (Model Competition)")
     break_window = st.sidebar.number_input(
         "Evaluation Window (Days)", 
         min_value=10, max_value=200, value=60, step=10,
-        help="The amount of data analyzed in a single chunk to decide if the trend is linear or exponential. A wider window is more stable against noise, but might detect the break slightly later."
+        help="The chunk of days analyzed at one time to check if the data is bending. A wider window prevents false alarms from noisy data, but might detect the actual break a few days later."
     )
     
     col_s, col_t = st.sidebar.columns(2)
@@ -681,13 +698,13 @@ def main():
         break_step = st.number_input(
             "Step Size (Days)", 
             min_value=1, max_value=30, value=7, step=1,
-            help="How many days the algorithm jumps forward after each check. Smaller steps give exact dates but take longer to calculate. 7 days checks once a week."
+            help="How many days the detector jumps forward between checks. Setting this to 7 means the algorithm checks for a structural break once a week."
         )
     with col_t:
         break_sustained = st.number_input(
             "Sustained Wins", 
             min_value=1, max_value=10, value=2, step=1,
-            help="The failsafe. The exponential model must beat the linear model this many consecutive times to officially trigger the 'Structural Break' alarm. Prevents false positives from random data spikes."
+            help="The failsafe mechanism. The Exponential model must beat the Linear model this many consecutive times before the 'Structural Break' alarm triggers. Prevents false positives."
         )
 
     # 1. Load Data
