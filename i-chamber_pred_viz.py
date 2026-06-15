@@ -850,36 +850,72 @@ def generate_simulation_dashboards(raw_df):
     )
     st.plotly_chart(fig_b, use_container_width=True)
 
-    # ==========================================
-    # CHART C: Aggregated Scatter (capped + bounded view)
+        # ==========================================
+    # CHART C: Aggregated Scatter
+    #   X (Actual RUL): UNCAPPED  -> shows true distance to crossing
+    #   Y (Predicted RUL): CAPPED @ RUL_HORIZON
     # ==========================================
     col1, col2 = st.columns(2)
-    df_valid = df.copy()  # capped columns are defined everywhere now
+    df_scatter = df.copy()
+
+    # X axis: uncapped actual. "Never crosses" (NaN) is placed just beyond the
+    # largest real actual so it's visible and clearly separated, not piled at 365.
+    real_actual_max = df_scatter['Actual_RUL'].max(skipna=True)
+    if pd.isna(real_actual_max):
+        real_actual_max = RUL_HORIZON  # no real crossings at all -> fall back
+    never_pos = real_actual_max * 1.15  # parking lane for "Never Breaches"
+
+    df_scatter['Actual_RUL_plot'] = df_scatter['Actual_RUL'].fillna(never_pos)
+    # Y axis: predicted stays capped at the horizon.
+    # (Nominal_RUL_c was already computed above via to_horizon.)
 
     with col1:
         st.subheader("Chart C: Prediction Scatter")
-        if not df_valid.empty:
-            view_max = RUL_HORIZON * 1.05  # bounded & stable thanks to the horizon cap
+        if not df_scatter.empty:
+            # Bigger, decoupled window: X follows the real data, Y bounded to horizon.
+            x_view_max = max(never_pos, action_window * 2) * 1.10
+            y_view_max = RUL_HORIZON * 1.05
 
             fig_c = px.scatter(
-                df_valid, x="Actual_RUL_c", y="Nominal_RUL_c", color="Status",
+                df_scatter, x="Actual_RUL_plot", y="Nominal_RUL_c", color="Status",
                 hover_data=["Channel", "Evaluation_Day", "Hover_Pred", "Hover_Act"],
                 color_discrete_map=color_map_status
             )
-            fig_c.add_trace(go.Scatter(x=[0, view_max], y=[0, view_max], mode='lines',
-                                       name='Perfect Prediction', line=dict(color='black', dash='dash')))
+
+            # Perfect-prediction reference line (only meaningful where both axes overlap).
+            diag_max = min(x_view_max, y_view_max)
+            fig_c.add_trace(go.Scatter(
+                x=[0, diag_max], y=[0, diag_max], mode='lines',
+                name='Perfect Prediction', line=dict(color='black', dash='dash')
+            ))
+
+            # Action-window guides.
             fig_c.add_vline(x=action_window, line_width=1, line_dash="dot", line_color="gray")
             fig_c.add_hline(y=action_window, line_width=1, line_dash="dot", line_color="gray")
+
+            # Mark the "Never Breaches" parking lane.
+            fig_c.add_vline(x=never_pos, line_width=1, line_dash="dashdot", line_color="lightgray")
+            fig_c.add_annotation(
+                x=never_pos, y=y_view_max, yanchor="top", showarrow=False,
+                text="Never crosses →", font=dict(size=11, color="gray"), xshift=-5, xanchor="right"
+            )
+
+            # Horizon cap guide on the predicted axis.
+            fig_c.add_hline(y=RUL_HORIZON, line_width=1, line_dash="dashdot", line_color="lightgray")
+
             fig_c.update_layout(
-                xaxis_title=f"Actual RUL (Days, capped @ {RUL_HORIZON})",
+                xaxis_title="Actual RUL (Days, uncapped)",
                 yaxis_title=f"Predicted RUL (Days, capped @ {RUL_HORIZON})",
-                xaxis=dict(range=[0, view_max]), yaxis=dict(range=[0, view_max]),
-                height=450, template="plotly_white",
+                xaxis=dict(range=[0, x_view_max]),
+                yaxis=dict(range=[0, y_view_max]),
+                height=600,  # taller window
+                template="plotly_white",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
             st.plotly_chart(fig_c, use_container_width=True)
         else:
             st.info("No simulation data available to scatter.")
+
 
 
 # ---------------------------------------------------------
