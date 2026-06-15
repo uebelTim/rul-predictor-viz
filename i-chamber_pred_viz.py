@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+import seaborn as sns
 import streamlit as st
 from streamlit_sortables import sort_items 
 
@@ -719,6 +720,11 @@ def generate_simulation_dashboards(raw_df):
     then generates Chart A (Status Heatmap), Chart B (Bias Heatmap), Chart C (Scatter), and Chart D (Bias Bar).
     """
     df = raw_df.copy() # Protect the original session state data
+    df['Channel'] = df['Channel'].astype(str) # Force channels to be treated as strings
+
+    # --- HARD LIMIT: Cap predictions and actuals at 365 days ---
+    df['Nominal_RUL'] = df['Nominal_RUL'].clip(upper=365)
+    df['Actual_RUL'] = df['Actual_RUL'].clip(upper=365)
 
     st.markdown("---")
     st.header("📊 Fleet Backtesting Results")
@@ -728,10 +734,10 @@ def generate_simulation_dashboards(raw_df):
     action_window = st.slider(
         "Action Window (Days)", 
         min_value=5, max_value=90, value=30, step=1,
-        help="[Updates Instantly] Defines your operational horizon. This window is used to calculate the True/False Positives and Negatives. If the algorithm predicts a failure inside this window, it is a 'Positive'. If the actual failure happens inside this window, it is a 'True Positive'. Otherwise, it flags a False Positive (False Alarm) or False Negative (Missed Failure)."
+        help="[Updates Instantly] Defines your operational horizon. This window is used to calculate the True/False Positives and Negatives. If the algorithm predicts a threshold crossing inside this window, it is a 'Positive'. If the actual threshold crossing happens inside this window, it is a 'True Positive'. Otherwise, it flags a False Positive (False Alarm) or False Negative (Missed Crossing)."
     )
 
-    # 2. VECTORIZED POST-PROCESSING (Lightning Fast)
+    # 2. VECTORIZED POST-PROCESSING
     actual_safe = df['Actual_RUL'].isna() | (df['Actual_RUL'] > action_window)
     pred_safe = df['Nominal_RUL'].isna() | (df['Nominal_RUL'] > action_window)
     
@@ -741,7 +747,7 @@ def generate_simulation_dashboards(raw_df):
     df.loc[~actual_safe & ~pred_safe, 'Status'] = 'True Positive'
     df.loc[~actual_safe & pred_safe, 'Status'] = 'False Negative'
 
-    # Dynamic Bias Score (Scales exactly to the current Action Window)
+    # Dynamic Bias Score 
     error = df['Nominal_RUL'] - df['Actual_RUL']
     df['Bias_Score'] = np.clip((error + action_window) / (action_window * 2), 0.0, 1.0)
 
@@ -749,7 +755,6 @@ def generate_simulation_dashboards(raw_df):
     # --- SHARED HOVER DATA PREPARATION ---
     df['Eval_Day_Rounded'] = df['Evaluation_Day'].round().astype(int)
     
-    # Format RULs for hover tooltips (Handling NaNs gracefully)
     df['Hover_Pred'] = df['Nominal_RUL'].apply(lambda x: f"{x:.1f} Days" if pd.notna(x) else "Safe/Unknown")
     df['Hover_Act'] = df['Actual_RUL'].apply(lambda x: f"{x:.1f} Days" if pd.notna(x) else "Never Breaches")
     
@@ -771,10 +776,10 @@ def generate_simulation_dashboards(raw_df):
     customdata_a = np.dstack((pivot_status_text.values, pivot_pred.values, pivot_act.values))
     
     colorscale_a = [
-        [0.0, '#E8F5E9'], # 0: True Negative (Light Green)
-        [0.33, '#FFB74D'], # 1: False Positive (Orange)
-        [0.66, '#4CAF50'], # 2: True Positive (Dark Green)
-        [1.0, '#F44336']   # 3: False Negative (Red)
+        [0.0, '#E8F5E9'], # True Negative (Light Green)
+        [0.33, '#FFB74D'], # False Positive (Orange)
+        [0.66, '#4CAF50'], # True Positive (Dark Green)
+        [1.0, '#F44336']   # False Negative (Red)
     ]
 
     fig_a = go.Figure()
@@ -784,16 +789,13 @@ def generate_simulation_dashboards(raw_df):
         hovertemplate="<b>Day:</b> %{x}<br><b>Channel:</b> %{y}<br><b>Result:</b> %{customdata[0]}<br><b>Predicted:</b> %{customdata[1]}<br><b>Actual:</b> %{customdata[2]}<extra></extra>"
     ))
     
-    # Dummy traces for the Legend
     for name, color in [("True Negative (Safe)", '#E8F5E9'), ("False Positive (Early Alarm)", '#FFB74D'), 
-                        ("True Positive (Good Catch)", '#4CAF50'), ("False Negative (Missed Break)", '#F44336')]:
-        fig_a.add_trace(go.Scatter(
-            x=[None], y=[None], mode='markers',
-            marker=dict(size=15, color=color, symbol='square', line=dict(color='black', width=1)), name=name
-        ))
+                        ("True Positive (Good Catch)", '#4CAF50'), ("False Negative (Missed Crossing)", '#F44336')]:
+        fig_a.add_trace(go.Scatter(x=[None], y=[None], mode='markers', marker=dict(size=15, color=color, symbol='square', line=dict(color='black', width=1)), name=name))
 
     fig_a.update_layout(
         xaxis_title="Simulation Day", yaxis_title="Channel", height=400, template="plotly_white", margin=dict(t=30, b=30),
+        yaxis=dict(type='category', dtick=1), # Force all channel ticks
         legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5, title=None)
     )
     st.plotly_chart(fig_a, use_container_width=True)
@@ -805,8 +807,10 @@ def generate_simulation_dashboards(raw_df):
     st.subheader("Chart B: Directional Bias Matrix (Continuous)")
     st.markdown(f"*(Dark = >{action_window} Days Early | Orange = Perfect | Yellow = >{action_window} Days Late)*")
     
-    pivot_bias = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Bias_Score', aggfunc='first')
+    # Extract native Seaborn 'rocket' palette and convert to Plotly Hex array
+    rocket_palette = sns.color_palette("rocket", n_colors=256).as_hex()
     
+    pivot_bias = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Bias_Score', aggfunc='first')
     df['Hover_Bias'] = df['Bias_Score'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
     pivot_bias_text = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Bias', aggfunc='first')
     
@@ -814,12 +818,15 @@ def generate_simulation_dashboards(raw_df):
     
     fig_b = go.Figure(data=go.Heatmap(
         z=pivot_bias.values, x=pivot_bias.columns, y=pivot_bias.index,
-        colorscale='Magma', zmin=0.0, zmax=1.0, showscale=True, hoverongaps=False, customdata=customdata_b,
+        colorscale=rocket_palette, zmin=0.0, zmax=1.0, showscale=True, hoverongaps=False, customdata=customdata_b,
         colorbar=dict(title="Bias Score", tickvals=[0, 0.5, 1], ticktext=["0.0 (Early)", "0.5", "1.0 (Late)"]),
         hovertemplate="<b>Day:</b> %{x}<br><b>Channel:</b> %{y}<br><b>Bias Score:</b> %{customdata[0]}<br><b>Predicted:</b> %{customdata[1]}<br><b>Actual:</b> %{customdata[2]}<extra></extra>"
     ))
     
-    fig_b.update_layout(xaxis_title="Simulation Day", yaxis_title="Channel", height=400, template="plotly_white", margin=dict(t=30, b=30))
+    fig_b.update_layout(
+        xaxis_title="Simulation Day", yaxis_title="Channel", height=400, template="plotly_white", margin=dict(t=30, b=30),
+        yaxis=dict(type='category', dtick=1) # Force all channel ticks
+    )
     st.plotly_chart(fig_b, use_container_width=True)
 
 
@@ -832,20 +839,20 @@ def generate_simulation_dashboards(raw_df):
     with col1:
         st.subheader("Chart C: Prediction Scatter")
         if not df_valid.empty:
-            max_val = max(df_valid['Actual_RUL'].max(), df_valid['Nominal_RUL'].max()) * 1.1
+            view_max = max(df_valid['Actual_RUL'].max(), df_valid['Nominal_RUL'].max(), action_window * 2) * 1.05 
             
             fig_c = px.scatter(
                 df_valid, x="Actual_RUL", y="Nominal_RUL", color="Status", 
                 hover_data=["Channel", "Evaluation_Day"],
                 color_discrete_map={"True Positive": "#4CAF50", "False Positive": "#FFB74D", "True Negative": "#E8F5E9", "False Negative": "#F44336"}
             )
-            fig_c.add_trace(go.Scatter(x=[0, max_val], y=[0, max_val], mode='lines', name='Perfect Prediction', line=dict(color='black', dash='dash')))
+            fig_c.add_trace(go.Scatter(x=[0, view_max], y=[0, view_max], mode='lines', name='Perfect Prediction', line=dict(color='black', dash='dash')))
             fig_c.add_vline(x=action_window, line_width=1, line_dash="dot", line_color="gray", annotation_text="Action Window", annotation_position="top left")
             fig_c.add_hline(y=action_window, line_width=1, line_dash="dot", line_color="gray")
             
             fig_c.update_layout(
                 xaxis_title="Actual RUL (Days)", yaxis_title="Predicted RUL (Days)",
-                xaxis=dict(range=[0, max_val]), yaxis=dict(range=[0, max_val]),
+                xaxis=dict(range=[0, view_max]), yaxis=dict(range=[0, view_max]), 
                 height=450, template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
             st.plotly_chart(fig_c, use_container_width=True)
@@ -859,11 +866,12 @@ def generate_simulation_dashboards(raw_df):
             
             fig_d = px.bar(
                 bias_summary, x="Bias_Score", y="Channel", orientation='h', color="Bias_Score",
-                color_continuous_scale="Magma", range_color=[0, 1]
+                color_continuous_scale=rocket_palette, range_color=[0, 1]
             )
             fig_d.add_vline(x=0.5, line_width=2, line_dash="dash", line_color="black")
             fig_d.update_layout(
                 xaxis_title="Average Bias Score", yaxis_title="Channel",
+                yaxis=dict(type='category', dtick=1), # Force all channel ticks
                 xaxis=dict(range=[0, 1]), height=450, template="plotly_white", coloraxis_colorbar=dict(title="Bias")
             )
             st.plotly_chart(fig_d, use_container_width=True)
@@ -882,15 +890,27 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
         st.warning("Please upload a CSV file in the sidebar to begin.")
         return
 
-    # Simulation Controls (Action Window removed, moved to the Dashboard)
+    # Simulation Controls
     st.markdown("### Simulation Setup")
     col1, col2, col3 = st.columns(3)
+    
     with col1:
-        req_break = st.toggle("Require Structural Break", value=True, help="If ON, evaluates channels only AFTER a structural break.")
+        req_break = st.toggle(
+            "Require Structural Break", value=True, 
+            help="[Requires Simulation Re-run] ON: The engine ignores early data and only starts evaluating AFTER it detects a mathematical 'bend' in the trend. OFF: Evaluates every channel from Day 50 onward."
+        )
     with col2:
-        step_days = st.number_input("Timestep Interval (Days)", min_value=1, max_value=30, value=7)
+        step_days = st.number_input(
+            "Timestep Interval (Days)", 
+            min_value=1, max_value=30, value=7, 
+            help="[Requires Simulation Re-run] How many days the simulation jumps forward between calculations. Smaller numbers yield higher resolution data but take longer to process. 7 days = 1 evaluation per week."
+        )
     with col3:
-        target_thresh = st.number_input("Target Threshold", min_value=0.1, max_value=5.0, value=0.5, step=0.1)
+        target_thresh = st.number_input(
+            "Target Threshold", 
+            min_value=0.1, max_value=5.0, value=0.5, step=0.1,
+            help="[Requires Simulation Re-run] The critical limit line. Changing this requires the engine to recalculate the root intersections for every single historical curve."
+        )
 
     if 'sim_results' not in st.session_state:
         st.session_state['sim_results'] = None
@@ -916,7 +936,6 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
             crossing_indices = np.where(smooth_np >= target_thresh)[0]
             actual_crossing_day = time_arr_np[crossing_indices[0]] if len(crossing_indices) > 0 else np.nan
             
-            # --- Dynamically inject the Structural Break parameters here ---
             break_idx, _ = detect_structural_break(
                 time_arr, sensor_smooth, window=break_window, step=break_step, sustained_wins=break_sustained
             )
@@ -963,6 +982,7 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
             st.warning("No evaluations were run.")
 
     if st.session_state['sim_results'] is not None:
+        # Pass the raw dataframe to the dashboard generator
         generate_simulation_dashboards(st.session_state['sim_results'])
         
         with st.expander("View Raw Simulation Logs"):
