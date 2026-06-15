@@ -928,7 +928,7 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
 
         for idx, channel in enumerate(channels):
             # Update Overall Fleet UI
-            status_text.markdown(f"**Overall Fleet Progress:** Processing Channel `{channel}` ({idx + 1} / {total_channels})")
+            status_text.markdown(f"**Overall Fleet Progress:** Processing Channel **{channel}** ({idx + 1} / {total_channels})")
             sub_status_text.markdown(f"Initializing data for Channel `{channel}`...")
             sub_progress_bar.progress(0.0)
             
@@ -975,7 +975,7 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                 current_day = hist_time[-1]
                 
                 # Update Sub-Progress UI
-                sub_status_text.markdown(f"↳ Evaluating Timestep **{step_idx + 1} / {total_steps}** (Day {current_day:.1f})")
+                sub_status_text.markdown(f"Timestep **{step_idx + 1} / {total_steps}** (Day {current_day:.1f})")
                 
                 # Get all MSE scores for the logs
                 eval_win = min(50, len(hist_time))
