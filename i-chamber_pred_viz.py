@@ -916,7 +916,7 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
         channels = get_available_channels(uploaded_file)
         results_list = []
         
-        # --- UI Elements for Dual Progress Tracking ---
+        # UI Elements for Dual Progress Tracking
         st.markdown("#### Simulation Progress")
         status_text = st.empty()
         progress_bar = st.progress(0.0)
@@ -928,7 +928,7 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
 
         for idx, channel in enumerate(channels):
             # Update Overall Fleet UI
-            status_text.markdown(f"**Overall Fleet Progress:** Processing Channel **{channel}** ({idx + 1} / {total_channels})")
+            status_text.markdown(f"**Overall Fleet Progress:** Processing Channel `{channel}` ({idx + 1} / {total_channels})")
             sub_status_text.markdown(f"Initializing data for Channel `{channel}`...")
             sub_progress_bar.progress(0.0)
             
@@ -950,7 +950,6 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
             if req_break and break_idx is not None: 
                 start_idx = max(50, break_idx)
             elif req_break and break_idx is None: 
-                # Handle skipped channels cleanly in the UI
                 sub_status_text.markdown(f"⏭️ *Skipping Channel `{channel}` (No Structural Break detected).*")
                 sub_progress_bar.progress(1.0)
                 progress_bar.progress((idx + 1) / total_channels)
@@ -966,6 +965,11 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                 progress_bar.progress((idx + 1) / total_channels)
                 continue
 
+            # --- PREDICTION HISTORY ARRAYS FOR EMA STABILIZATION ---
+            history_nominal = []
+            history_upper = []
+            history_lower = []
+
             # --- INNER TIMESTEP LOOP ---
             for step_idx, current_cutoff in enumerate(timesteps):
                 hist_time = time_arr_np[:current_cutoff]
@@ -973,9 +977,7 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                 hist_raw = np.asarray(sensor_raw, dtype=float)[:current_cutoff]
                 
                 current_day = hist_time[-1]
-                
-                # Update Sub-Progress UI
-                sub_status_text.markdown(f"Timestep **{step_idx + 1} / {total_steps}** (Day {current_day:.1f})")
+                sub_status_text.markdown(f"↳ Evaluating Timestep **{step_idx + 1} / {total_steps}** (Day {current_day:.1f})")
                 
                 # Get all MSE scores for the logs
                 eval_win = min(50, len(hist_time))
@@ -992,39 +994,50 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                     best_model = manual_model
                 else:
                     if not top_models:
-                        best_model = "Linear" # Ultimate fallback if math fails
+                        best_model = "Linear"
                     else:
                         best_model = list(top_models.keys())[0]
                 
-                # Run the calculation with whichever model was chosen
-                n_rul, u_rul, l_rul = calculate_rul_headless(
+                # Calculate raw RUL predictions
+                raw_n, raw_u, raw_l = calculate_rul_headless(
                     hist_time, hist_smooth, hist_raw, best_model, target_thresh, use_dynamic_variance=use_dynamic_variance
                 )
                 
+                # Pre-processing: Treat NaNs (Safe/Infinite RUL) as 365 days to maintain stable math inside the EMA
+                n_val = 365.0 if np.isnan(raw_n) else float(raw_n)
+                u_val = 365.0 if np.isnan(raw_u) else float(raw_u)
+                l_val = 365.0 if np.isnan(raw_l) else float(raw_l)
+                
+                history_nominal.append(n_val)
+                history_upper.append(u_val)
+                history_lower.append(l_val)
+                
+                # --- APPLY RUNNING EMA SMOOTHING (Span = 4) ---
+                smooth_n = pd.Series(history_nominal).ewm(span=4, adjust=False).mean().iloc[-1]
+                smooth_u = pd.Series(history_upper).ewm(span=4, adjust=False).mean().iloc[-1]
+                smooth_l = pd.Series(history_lower).ewm(span=4, adjust=False).mean().iloc[-1]
+                
                 actual_rul = actual_crossing_day - current_day if not np.isnan(actual_crossing_day) else np.nan
                 
-                # Fill inner progress bar
                 sub_progress_bar.progress((step_idx + 1) / total_steps)
 
                 if not np.isnan(actual_rul) and actual_rul < 0:
-                    continue # Skip logging evaluations if the machine has already broken
+                    continue # Skip logging if the asset has already crossed the threshold
 
                 results_list.append({
                     'Channel': channel,
                     'Evaluation_Day': current_day,
                     'Model_Used': f"{best_model} (Override)" if override_model else best_model,
                     'Actual_RUL': actual_rul,
-                    'Nominal_RUL': n_rul,
-                    'Upper_Risk_RUL': u_rul,
-                    'Lower_Risk_RUL': l_rul,
+                    'Nominal_RUL': smooth_n,     # Saved as the stabilized stabilized value
+                    'Upper_Risk_RUL': smooth_u,   # Saved as the stabilized stabilized value
+                    'Lower_Risk_RUL': smooth_l,   # Saved as the stabilized stabilized value
                     'All_Models_MSE': mse_log_str 
                 })
             
-            # Channel is fully evaluated, update overall progress
             progress_bar.progress((idx + 1) / total_channels)
 
         status_text.success("✅ Fleet Simulation Complete!")
-        # Erase the inner progress tracker so the UI is clean when finished
         sub_status_text.empty()
         sub_progress_bar.empty()
         
