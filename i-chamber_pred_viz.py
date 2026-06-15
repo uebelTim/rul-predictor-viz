@@ -838,7 +838,7 @@ def generate_simulation_dashboards(raw_df):
 # ---------------------------------------------------------
 # NEW: The Second Page (Live Simulation)
 # ---------------------------------------------------------
-def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_window, use_dynamic_variance):
+def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_window, use_dynamic_variance, break_window, break_step, break_sustained):
     st.title("Fleet-Wide Live Simulation")
     st.markdown("Run the predictive engine across all channels and all historical timesteps to generate statistical confidence metrics.")
     
@@ -880,7 +880,10 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
             crossing_indices = np.where(smooth_np >= target_thresh)[0]
             actual_crossing_day = time_arr_np[crossing_indices[0]] if len(crossing_indices) > 0 else np.nan
             
-            break_idx, _ = detect_structural_break(time_arr, sensor_smooth, window=60, step=7, sustained_wins=2)
+            # --- Dynamically inject the Structural Break parameters here ---
+            break_idx, _ = detect_structural_break(
+                time_arr, sensor_smooth, window=break_window, step=break_step, sustained_wins=break_sustained
+            )
             
             start_idx = 50 
             if req_break and break_idx is not None: start_idx = max(50, break_idx)
@@ -904,7 +907,6 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                 if not np.isnan(actual_rul) and actual_rul < 0:
                     continue # Skip evaluations if the machine has already broken
 
-                # We only save the raw data. The Dashboard generator handles the Status/Bias calculation!
                 results_list.append({
                     'Channel': channel,
                     'Evaluation_Day': current_day,
@@ -925,7 +927,6 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
             st.warning("No evaluations were run.")
 
     if st.session_state['sim_results'] is not None:
-        # Pass the raw dataframe to the dashboard generator
         generate_simulation_dashboards(st.session_state['sim_results'])
         
         with st.expander("View Raw Simulation Logs"):
@@ -972,6 +973,27 @@ def main():
         help="ON: The confidence bands widen over time as the machine degrades (Highly realistic). OFF: The bands stay parallel to the nominal fit using the last known standard deviation."
     )
     
+    st.sidebar.markdown("### Structural Break (Model Competition)")
+    break_window = st.sidebar.number_input(
+        "Evaluation Window (Days)", 
+        min_value=10, max_value=200, value=60, step=10,
+        help="The chunk of days analyzed at one time to check if the data is bending. A wider window prevents false alarms from noisy data, but might detect the actual break a few days later."
+    )
+    
+    col_s, col_t = st.sidebar.columns(2)
+    with col_s:
+        break_step = st.number_input(
+            "Step Size (Days)", 
+            min_value=1, max_value=30, value=7, step=1,
+            help="How many days the detector jumps forward between checks. Setting this to 7 means the algorithm checks for a structural break once a week."
+        )
+    with col_t:
+        break_sustained = st.number_input(
+            "Sustained Wins", 
+            min_value=1, max_value=10, value=2, step=1,
+            help="The failsafe mechanism. The Exponential model must beat the Linear model this many consecutive times before the 'Structural Break' alarm triggers. Prevents false positives."
+        )
+
     st.sidebar.markdown("### Router Priority Ranking")
     with st.sidebar.expander("Configure Router Ranking", expanded=False):
         st.caption("Drag and drop to set tie-breaker priority (Top = Highest Priority). Used when multiple models fit the data equally well.")
@@ -1018,26 +1040,6 @@ def main():
         )
         manual_model = st.sidebar.selectbox("Force specific model:", options=AVAILABLE_MODELS, disabled=not override_model)
 
-        st.sidebar.markdown("### 5. Structural Break (Model Competition)")
-        break_window = st.sidebar.number_input(
-            "Evaluation Window (Days)", 
-            min_value=10, max_value=200, value=60, step=10,
-            help="The chunk of days analyzed at one time to check if the data is bending. A wider window prevents false alarms from noisy data, but might detect the actual break a few days later."
-        )
-        
-        col_s, col_t = st.sidebar.columns(2)
-        with col_s:
-            break_step = st.number_input(
-                "Step Size (Days)", 
-                min_value=1, max_value=30, value=7, step=1,
-                help="How many days the detector jumps forward between checks. Setting this to 7 means the algorithm checks for a structural break once a week."
-            )
-        with col_t:
-            break_sustained = st.number_input(
-                "Sustained Wins", 
-                min_value=1, max_value=10, value=2, step=1,
-                help="The failsafe mechanism. The Exponential model must beat the Linear model this many consecutive times before the 'Structural Break' alarm triggers. Prevents false positives."
-            )
 
         # Load Data
         sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(
@@ -1151,9 +1153,8 @@ def main():
     # PAGE 2: LIVE FLEET SIMULATION
     # =========================================================
     elif app_mode == "Live Fleet Simulation":
-        # Make sure the definition of page_live_simulation() does not request global_slope
         page_live_simulation(
-            uploaded_file, user_priority_dict, outlier_factor, outlier_window, use_dynamic_variance
+            uploaded_file, user_priority_dict, outlier_factor, outlier_window, use_dynamic_variance, break_window, break_step, break_sustained
         )
 
 if __name__ == "__main__":
