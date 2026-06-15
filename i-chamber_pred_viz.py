@@ -719,15 +719,17 @@ def calculate_rul_headless(time_raw, sensor_smooth, sensor_raw, model_choice, th
     return nom_rul, upper_rul, lower_rul
 
 
+# ---------------------------------------------------------
+# NEW: Simulation Dashboard Generator (With Dynamic Processing)
+# ---------------------------------------------------------
 def generate_simulation_dashboards(raw_df):
     """
     Applies the dynamic Action Window to the raw simulation data, 
-    then generates Chart A (Status Stacked Bar), Chart B (Bias Heatmap), 
-    and Chart C (Prediction Scatter).
+    then generates Chart A (Status Heatmap), Chart B (Bias Heatmap), Chart C (Scatter), and Chart D (Outcome Distribution).
     """
     df = raw_df.copy() 
     
-    # Force categorical Y-axis for consistent labeling
+    # FORCE CATEGORICAL Y-AXIS: Append "CH-" so Plotly cannot treat these as mathematical numbers
     df['Channel'] = "CH-" + df['Channel'].astype(str) 
 
     df['Nominal_RUL'] = df['Nominal_RUL'].clip(upper=365)
@@ -736,10 +738,11 @@ def generate_simulation_dashboards(raw_df):
     st.markdown("---")
     st.header("📊 Fleet Backtesting Results")
     
+    st.markdown("### Operational Thresholds")
     action_window = st.slider(
         "Action Window (Days)", 
         min_value=5, max_value=90, value=30, step=1,
-        help="Defines your operational horizon for status calculation."
+        help="[Updates Instantly] Defines your operational horizon. Used to calculate True/False Positives."
     )
 
     actual_safe = df['Actual_RUL'].isna() | (df['Actual_RUL'] > action_window)
@@ -753,83 +756,125 @@ def generate_simulation_dashboards(raw_df):
 
     error = df['Nominal_RUL'] - df['Actual_RUL']
     df['Bias_Score'] = np.clip((error + action_window) / (action_window * 2), 0.0, 1.0)
+
     df['Eval_Day_Rounded'] = df['Evaluation_Day'].round().astype(int)
+    df['Hover_Pred'] = df['Nominal_RUL'].apply(lambda x: f"{x:.1f} Days" if pd.notna(x) else "Safe/Unknown")
+    df['Hover_Act'] = df['Actual_RUL'].apply(lambda x: f"{x:.1f} Days" if pd.notna(x) else "Never Breaches")
     
-    color_map_status = {
-        "True Positive": "#4CAF50", 
-        "False Positive": "#FFB74D", 
-        "True Negative": "#E8F5E9", 
-        "False Negative": "#F44336"
-    }
+    pivot_pred = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Pred', aggfunc='first')
+    pivot_act = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Act', aggfunc='first')
+
+    color_map_status = {"True Positive": "#4CAF50", "False Positive": "#FFB74D", "True Negative": "#E8F5E9", "False Negative": "#F44336"}
+
 
     # ==========================================
-    # CHART A: Status Stacked Bar
+    # CHART A: Lifecycle Confusion Heatmap
     # ==========================================
-    st.subheader("Chart A: Lifecycle Status Distribution")
-    status_agg = df.groupby(['Eval_Day_Rounded', 'Status']).size().reset_index(name='Count')
+    st.subheader("Chart A: Lifecycle Confusion Matrix (Categorical)")
     
-    fig_a = px.bar(
-        status_agg, x='Eval_Day_Rounded', y='Count', color='Status',
-        color_discrete_map=color_map_status,
-        labels={'Eval_Day_Rounded': 'Simulation Day', 'Count': 'Channel Count'}
+    status_map = {"True Negative": 0, "False Positive": 1, "True Positive": 2, "False Negative": 3}
+    df['Status_Code'] = df['Status'].map(status_map)
+    
+    pivot_status_code = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status_Code', aggfunc='first')
+    pivot_status_text = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status', aggfunc='first')
+    customdata_a = np.dstack((pivot_status_text.values, pivot_pred.values, pivot_act.values))
+    
+    colorscale_a = [[0.0, '#E8F5E9'], [0.33, '#FFB74D'], [0.66, '#4CAF50'], [1.0, '#F44336']]
+
+    fig_a = go.Figure()
+    fig_a.add_trace(go.Heatmap(
+        z=pivot_status_code.values, x=pivot_status_code.columns, y=pivot_status_code.index,
+        colorscale=colorscale_a, zmin=0, zmax=3, showscale=False, hoverongaps=False, customdata=customdata_a,
+        hovertemplate="<b>Day:</b> %{x}<br><b>Channel:</b> %{y}<br><b>Result:</b> %{customdata[0]}<br><b>Predicted:</b> %{customdata[1]}<br><b>Actual:</b> %{customdata[2]}<extra></extra>"
+    ))
+    
+    for name, color in [("True Negative (Safe)", '#E8F5E9'), ("False Positive (Early Alarm)", '#FFB74D'), 
+                        ("True Positive (Good Catch)", '#4CAF50'), ("False Negative (Missed Crossing)", '#F44336')]:
+        fig_a.add_trace(go.Scatter(x=[None], y=[None], mode='markers', marker=dict(size=15, color=color, symbol='square', line=dict(color='black', width=1)), name=name))
+
+    fig_a.update_layout(
+        xaxis_title="Simulation Day", yaxis_title="Channel", height=400, template="plotly_white", margin=dict(t=30, b=30),
+        yaxis=dict(type='category', autorange="reversed"), 
+        legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5, title=None)
     )
-    fig_a.update_layout(height=400, template="plotly_white", barmode='stack')
     st.plotly_chart(fig_a, use_container_width=True)
+
 
     # ==========================================
     # CHART B: Directional Bias Heatmap
     # ==========================================
-    st.subheader("Chart B: Directional Bias Matrix")
-    
-    # Create master index from all unique channels present in the simulation
-    all_channels = sorted(df['Channel'].unique())
-    pivot_pred = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Nominal_RUL', aggfunc='first')
-    
-    # Force bias table to match dimensions of all channels using reindex
-    pivot_bias = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Bias_Score', aggfunc='first').reindex(all_channels)
+    st.subheader("Chart B: Directional Bias Matrix (Continuous)")
+    st.markdown(f"*(Dark = >{action_window} Days Early | Orange = Perfect | Yellow = >{action_window} Days Late)*")
     
     rocket_palette = sns.color_palette("rocket", n_colors=256).as_hex()
+    pivot_bias = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Bias_Score', aggfunc='first')
+    
+    df['Hover_Bias'] = df['Bias_Score'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
+    pivot_bias_text = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Bias', aggfunc='first')
+    customdata_b = np.dstack((pivot_bias_text.values, pivot_pred.values, pivot_act.values))
     
     fig_b = go.Figure(data=go.Heatmap(
         z=pivot_bias.values, x=pivot_bias.columns, y=pivot_bias.index,
-        colorscale=rocket_palette, zmin=0.0, zmax=1.0, showscale=True,
-        colorbar=dict(title="Bias Score", tickvals=[0, 0.5, 1], ticktext=["0.0 (Early)", "0.5", "1.0 (Late)"])
+        colorscale=rocket_palette, zmin=0.0, zmax=1.0, showscale=True, hoverongaps=False, customdata=customdata_b,
+        colorbar=dict(title="Bias Score", tickvals=[0, 0.5, 1], ticktext=["0.0 (Early)", "0.5", "1.0 (Late)"]),
+        hovertemplate="<b>Day:</b> %{x}<br><b>Channel:</b> %{y}<br><b>Bias Score:</b> %{customdata[0]}<br><b>Predicted:</b> %{customdata[1]}<br><b>Actual:</b> %{customdata[2]}<extra></extra>"
     ))
     
     fig_b.update_layout(
-        height=max(400, len(all_channels) * 20), 
-        template="plotly_white", 
-        yaxis=dict(type='category', autorange="reversed"),
-        xaxis_title="Simulation Day", yaxis_title="Channel"
+        xaxis_title="Simulation Day", yaxis_title="Channel", height=400, template="plotly_white", margin=dict(t=30, b=30),
+        yaxis=dict(type='category', autorange="reversed") 
     )
     st.plotly_chart(fig_b, use_container_width=True)
 
+
     # ==========================================
-    # CHART C: Prediction Scatter
+    # CHART C & D: Aggregated Views
     # ==========================================
-    st.subheader("Chart C: Prediction Scatter")
+    col1, col2 = st.columns(2)
     df_valid = df.dropna(subset=['Actual_RUL', 'Nominal_RUL']).copy()
 
-    if not df_valid.empty:
-        view_max = max(df_valid['Actual_RUL'].max(), df_valid['Nominal_RUL'].max(), action_window * 2) * 1.05 
+    with col1:
+        st.subheader("Chart C: Prediction Scatter")
+        if not df_valid.empty:
+            view_max = max(df_valid['Actual_RUL'].max(), df_valid['Nominal_RUL'].max(), action_window * 2) * 1.05 
+            
+            fig_c = px.scatter(
+                df_valid, x="Actual_RUL", y="Nominal_RUL", color="Status", 
+                hover_data=["Channel", "Evaluation_Day"],
+                color_discrete_map=color_map_status
+            )
+            fig_c.add_trace(go.Scatter(x=[0, view_max], y=[0, view_max], mode='lines', name='Perfect Prediction', line=dict(color='black', dash='dash')))
+            fig_c.add_vline(x=action_window, line_width=1, line_dash="dot", line_color="gray")
+            fig_c.add_hline(y=action_window, line_width=1, line_dash="dot", line_color="gray")
+            
+            fig_c.update_layout(
+                xaxis_title="Actual RUL (Days)", yaxis_title="Predicted RUL (Days)",
+                xaxis=dict(range=[0, view_max]), yaxis=dict(range=[0, view_max]), 
+                height=450, template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            st.plotly_chart(fig_c, use_container_width=True)
+        else:
+            st.info("No threshold crossings occurred in the historical data to scatter.")
+
+    with col2:
+        st.subheader("Chart D: Outcome Distribution by Channel")
+        st.markdown("*A total count of evaluations across the entire simulation.*")
         
-        fig_c = px.scatter(
-            df_valid, x="Actual_RUL", y="Nominal_RUL", color="Status", 
-            hover_data=["Channel", "Evaluation_Day"],
+        # Calculate counts of each Status per channel
+        status_counts = df.groupby(['Channel', 'Status']).size().reset_index(name='Count')
+        
+        fig_d = px.bar(
+            status_counts, y="Channel", x="Count", color="Status", orientation='h',
             color_discrete_map=color_map_status
         )
-        fig_c.add_trace(go.Scatter(x=[0, view_max], y=[0, view_max], mode='lines', name='Perfect Prediction', line=dict(color='black', dash='dash')))
-        fig_c.add_vline(x=action_window, line_width=1, line_dash="dot", line_color="gray")
-        fig_c.add_hline(y=action_window, line_width=1, line_dash="dot", line_color="gray")
         
-        fig_c.update_layout(
-            xaxis_title="Actual RUL (Days)", yaxis_title="Predicted RUL (Days)",
-            xaxis=dict(range=[0, view_max]), yaxis=dict(range=[0, view_max]), 
-            height=550, template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        fig_d.update_layout(
+            xaxis_title="Number of Evaluations", yaxis_title="Channel",
+            yaxis=dict(type='category', autorange="reversed"),
+            height=450, template="plotly_white", barmode='stack',
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
-        st.plotly_chart(fig_c, use_container_width=True)
-    else:
-        st.info("No threshold crossings occurred in the data.")
+        st.plotly_chart(fig_d, use_container_width=True)
             
 # ---------------------------------------------------------
 # NEW: The Second Page (Live Simulation)
