@@ -913,7 +913,7 @@ def generate_simulation_dashboards(raw_df):
                 template="plotly_white",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
-            st.plotly_chart(fig_c, use_container_width=True)
+            st.plotly_chart(fig_c, use_container_width=False)
         else:
             st.info("No simulation data available to scatter.")
 
