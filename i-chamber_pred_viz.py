@@ -614,7 +614,6 @@ def load_my_sensor_data(file_obj, col='32', outlier_factor=3.0, outlier_window=4
     
     return df_defect_daily[f'{col}_max_ema'], df_defect_daily[f'{col}_max'], df_defect_daily['elapsed_days']
 
-
 # ---------------------------------------------------------
 # NEW: Headless Math Engine (No Plotly rendering for speed)
 # ---------------------------------------------------------
@@ -639,7 +638,7 @@ def calculate_rul_headless(time_raw, sensor_smooth, sensor_raw, model_choice, th
     y_min, y_max = np.min(y_fit), np.max(y_fit)
     y_range = y_max - y_min
 
-    # --- Setup Model Bounds (Using the same configs as before) ---
+    # --- Setup Model Bounds for ALL available models ---
     if model_choice == 'Shifted Exponential':
         func = shifted_exponential_model
         p0 = [y_range * 0.1, 5.0, 0.5, y_min]
@@ -648,13 +647,22 @@ def calculate_rul_headless(time_raw, sensor_smooth, sensor_raw, model_choice, th
         func = rational_model
         p0 = [y_range, 0.5, y_min]
         bounds = ([0.0, 1e-3, y_min - 0.2], [np.inf, np.inf, y_min + 0.2])
-    # ... Add other models here as needed for the headless runner, 
-    # but since Shifted Exp and Rational win 99% of the time, we'll start with these.
-    else:
-        # Fallback to linear for speed if the complex models aren't chosen
+    elif model_choice == 'Arctangent':
+        func = arctan_model
+        p0 = [y_range * 1.1, 20.0, 0.5, y_min]
+        bounds = ([y_range * 0.5, 0.1, 0.0, y_min - 0.2], [max(2.0, y_range * 2.2), 500.0, 1.0, y_max + 0.2])
+    elif model_choice == 'Gompertz':
+        func = gompertz_model
+        p0 = [y_range * 1.1, 1.0, 0.1, y_min]
+        bounds = ([y_range * 0.8, 0.01, 1e-4, y_min - 0.2], [max(2.0, y_range * 2.2), 100.0, 50.0, y_max + 0.2])
+    elif model_choice == 'Softplus':
+        func = softplus_model
+        p0 = [y_range * 0.5, 10.0, 0.5, y_min]
+        bounds = ([1e-3, 1e-3, 0.0, y_min - 0.2], [y_range * 10.0, 500.0, 1.0, y_max + 0.2])
+    else: # Fallback to Linear
         func = linear_model
         p0 = [y_range, y_min]
-        bounds = ([-np.inf, y_min - 0.2], [np.inf, y_min + 0.2])
+        bounds = ([-np.inf, y_min - 0.2], [np.inf, y_max + 0.2])
 
     try:
         params, _ = curve_fit(func, t_fit, y_fit, p0=p0, bounds=bounds, maxfev=5000)
@@ -717,27 +725,26 @@ def calculate_rul_headless(time_raw, sensor_smooth, sensor_raw, model_choice, th
 def generate_simulation_dashboards(raw_df):
     """
     Applies the dynamic Action Window to the raw simulation data, 
-    then generates Chart A (Status Heatmap), Chart B (Bias Heatmap), Chart C (Scatter), and Chart D (Bias Bar).
+    then generates Chart A (Status Heatmap), Chart B (Bias Heatmap), Chart C (Scatter), and Chart D (Outcome Distribution).
     """
-    df = raw_df.copy() # Protect the original session state data
-    df['Channel'] = df['Channel'].astype(str) # Force channels to be treated as strings
+    df = raw_df.copy() 
+    
+    # FORCE CATEGORICAL Y-AXIS: Append "CH-" so Plotly cannot treat these as mathematical numbers
+    df['Channel'] = "CH-" + df['Channel'].astype(str) 
 
-    # --- HARD LIMIT: Cap predictions and actuals at 365 days ---
     df['Nominal_RUL'] = df['Nominal_RUL'].clip(upper=365)
     df['Actual_RUL'] = df['Actual_RUL'].clip(upper=365)
 
     st.markdown("---")
     st.header("📊 Fleet Backtesting Results")
     
-    # 1. THE DYNAMIC ACTION WINDOW SLIDER
     st.markdown("### Operational Thresholds")
     action_window = st.slider(
         "Action Window (Days)", 
         min_value=5, max_value=90, value=30, step=1,
-        help="[Updates Instantly] Defines your operational horizon. This window is used to calculate the True/False Positives and Negatives. If the algorithm predicts a threshold crossing inside this window, it is a 'Positive'. If the actual threshold crossing happens inside this window, it is a 'True Positive'. Otherwise, it flags a False Positive (False Alarm) or False Negative (Missed Crossing)."
+        help="[Updates Instantly] Defines your operational horizon. Used to calculate True/False Positives."
     )
 
-    # 2. VECTORIZED POST-PROCESSING
     actual_safe = df['Actual_RUL'].isna() | (df['Actual_RUL'] > action_window)
     pred_safe = df['Nominal_RUL'].isna() | (df['Nominal_RUL'] > action_window)
     
@@ -747,19 +754,17 @@ def generate_simulation_dashboards(raw_df):
     df.loc[~actual_safe & ~pred_safe, 'Status'] = 'True Positive'
     df.loc[~actual_safe & pred_safe, 'Status'] = 'False Negative'
 
-    # Dynamic Bias Score 
     error = df['Nominal_RUL'] - df['Actual_RUL']
     df['Bias_Score'] = np.clip((error + action_window) / (action_window * 2), 0.0, 1.0)
 
-
-    # --- SHARED HOVER DATA PREPARATION ---
     df['Eval_Day_Rounded'] = df['Evaluation_Day'].round().astype(int)
-    
     df['Hover_Pred'] = df['Nominal_RUL'].apply(lambda x: f"{x:.1f} Days" if pd.notna(x) else "Safe/Unknown")
     df['Hover_Act'] = df['Actual_RUL'].apply(lambda x: f"{x:.1f} Days" if pd.notna(x) else "Never Breaches")
     
     pivot_pred = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Pred', aggfunc='first')
     pivot_act = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Act', aggfunc='first')
+
+    color_map_status = {"True Positive": "#4CAF50", "False Positive": "#FFB74D", "True Negative": "#E8F5E9", "False Negative": "#F44336"}
 
 
     # ==========================================
@@ -772,15 +777,9 @@ def generate_simulation_dashboards(raw_df):
     
     pivot_status_code = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status_Code', aggfunc='first')
     pivot_status_text = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status', aggfunc='first')
-    
     customdata_a = np.dstack((pivot_status_text.values, pivot_pred.values, pivot_act.values))
     
-    colorscale_a = [
-        [0.0, '#E8F5E9'], # True Negative (Light Green)
-        [0.33, '#FFB74D'], # False Positive (Orange)
-        [0.66, '#4CAF50'], # True Positive (Dark Green)
-        [1.0, '#F44336']   # False Negative (Red)
-    ]
+    colorscale_a = [[0.0, '#E8F5E9'], [0.33, '#FFB74D'], [0.66, '#4CAF50'], [1.0, '#F44336']]
 
     fig_a = go.Figure()
     fig_a.add_trace(go.Heatmap(
@@ -795,7 +794,7 @@ def generate_simulation_dashboards(raw_df):
 
     fig_a.update_layout(
         xaxis_title="Simulation Day", yaxis_title="Channel", height=400, template="plotly_white", margin=dict(t=30, b=30),
-        yaxis=dict(type='category', dtick=1), # Force all channel ticks
+        yaxis=dict(type='category', autorange="reversed"), 
         legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5, title=None)
     )
     st.plotly_chart(fig_a, use_container_width=True)
@@ -807,13 +806,11 @@ def generate_simulation_dashboards(raw_df):
     st.subheader("Chart B: Directional Bias Matrix (Continuous)")
     st.markdown(f"*(Dark = >{action_window} Days Early | Orange = Perfect | Yellow = >{action_window} Days Late)*")
     
-    # Extract native Seaborn 'rocket' palette and convert to Plotly Hex array
     rocket_palette = sns.color_palette("rocket", n_colors=256).as_hex()
-    
     pivot_bias = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Bias_Score', aggfunc='first')
+    
     df['Hover_Bias'] = df['Bias_Score'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
     pivot_bias_text = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Bias', aggfunc='first')
-    
     customdata_b = np.dstack((pivot_bias_text.values, pivot_pred.values, pivot_act.values))
     
     fig_b = go.Figure(data=go.Heatmap(
@@ -825,7 +822,7 @@ def generate_simulation_dashboards(raw_df):
     
     fig_b.update_layout(
         xaxis_title="Simulation Day", yaxis_title="Channel", height=400, template="plotly_white", margin=dict(t=30, b=30),
-        yaxis=dict(type='category', dtick=1) # Force all channel ticks
+        yaxis=dict(type='category', autorange="reversed") 
     )
     st.plotly_chart(fig_b, use_container_width=True)
 
@@ -844,10 +841,10 @@ def generate_simulation_dashboards(raw_df):
             fig_c = px.scatter(
                 df_valid, x="Actual_RUL", y="Nominal_RUL", color="Status", 
                 hover_data=["Channel", "Evaluation_Day"],
-                color_discrete_map={"True Positive": "#4CAF50", "False Positive": "#FFB74D", "True Negative": "#E8F5E9", "False Negative": "#F44336"}
+                color_discrete_map=color_map_status
             )
             fig_c.add_trace(go.Scatter(x=[0, view_max], y=[0, view_max], mode='lines', name='Perfect Prediction', line=dict(color='black', dash='dash')))
-            fig_c.add_vline(x=action_window, line_width=1, line_dash="dot", line_color="gray", annotation_text="Action Window", annotation_position="top left")
+            fig_c.add_vline(x=action_window, line_width=1, line_dash="dot", line_color="gray")
             fig_c.add_hline(y=action_window, line_width=1, line_dash="dot", line_color="gray")
             
             fig_c.update_layout(
@@ -860,29 +857,29 @@ def generate_simulation_dashboards(raw_df):
             st.info("No threshold crossings occurred in the historical data to scatter.")
 
     with col2:
-        st.subheader("Chart D: Average Directional Bias")
-        if not df_valid.empty:
-            bias_summary = df_valid.groupby('Channel')['Bias_Score'].mean().reset_index().sort_values(by='Bias_Score')
-            
-            fig_d = px.bar(
-                bias_summary, x="Bias_Score", y="Channel", orientation='h', color="Bias_Score",
-                color_continuous_scale=rocket_palette, range_color=[0, 1]
-            )
-            fig_d.add_vline(x=0.5, line_width=2, line_dash="dash", line_color="black")
-            fig_d.update_layout(
-                xaxis_title="Average Bias Score", yaxis_title="Channel",
-                yaxis=dict(type='category', dtick=1), # Force all channel ticks
-                xaxis=dict(range=[0, 1]), height=450, template="plotly_white", coloraxis_colorbar=dict(title="Bias")
-            )
-            st.plotly_chart(fig_d, use_container_width=True)
-        else:
-            st.info("Not enough failure data to calculate bias scores.")
-            
+        st.subheader("Chart D: Outcome Distribution by Channel")
+        st.markdown("*A total count of evaluations across the entire simulation.*")
+        
+        # Calculate counts of each Status per channel
+        status_counts = df.groupby(['Channel', 'Status']).size().reset_index(name='Count')
+        
+        fig_d = px.bar(
+            status_counts, y="Channel", x="Count", color="Status", orientation='h',
+            color_discrete_map=color_map_status
+        )
+        
+        fig_d.update_layout(
+            xaxis_title="Number of Evaluations", yaxis_title="Channel",
+            yaxis=dict(type='category', autorange="reversed"),
+            height=450, template="plotly_white", barmode='stack',
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        st.plotly_chart(fig_d, use_container_width=True)
             
 # ---------------------------------------------------------
 # NEW: The Second Page (Live Simulation)
 # ---------------------------------------------------------
-def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_window, use_dynamic_variance, break_window, break_step, break_sustained):
+def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_window, use_dynamic_variance, break_window, break_step, break_sustained, override_model, manual_model):
     st.title("Fleet-Wide Live Simulation")
     st.markdown("Run the predictive engine across all channels and all historical timesteps to generate statistical confidence metrics.")
     
@@ -952,8 +949,27 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                 hist_raw = np.asarray(sensor_raw, dtype=float)[:current_cutoff]
                 
                 current_day = hist_time[-1]
-                best_model = "Shifted Exponential" 
                 
+                # --- Get all MSE scores for the logs ---
+                eval_win = min(50, len(hist_time))
+                top_models, all_models = evaluate_all_models(
+                    hist_time, hist_smooth, priority_ranking=priority_dict, eval_window=eval_win, plot=False, verbose=False
+                )
+                
+                mse_log_str = "All models failed"
+                if all_models:
+                    mse_log_str = " | ".join([f"{k}: {v['mse']:.5f}" for k, v in all_models.items() if v.get('mse', float('inf')) != float('inf')])
+                
+                # --- Apply the Model Override ---
+                if override_model:
+                    best_model = manual_model
+                else:
+                    if not top_models:
+                        best_model = "Linear" # Ultimate fallback if math fails
+                    else:
+                        best_model = list(top_models.keys())[0]
+                
+                # Run the calculation with whichever model was chosen
                 n_rul, u_rul, l_rul = calculate_rul_headless(
                     hist_time, hist_smooth, hist_raw, best_model, target_thresh, use_dynamic_variance=use_dynamic_variance
                 )
@@ -965,11 +981,12 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                 results_list.append({
                     'Channel': channel,
                     'Evaluation_Day': current_day,
-                    'Model_Used': best_model,
+                    'Model_Used': f"{best_model} (Override)" if override_model else best_model,
                     'Actual_RUL': actual_rul,
                     'Nominal_RUL': n_rul,
                     'Upper_Risk_RUL': u_rul,
-                    'Lower_Risk_RUL': l_rul
+                    'Lower_Risk_RUL': l_rul,
+                    'All_Models_MSE': mse_log_str 
                 })
             
             progress_bar.progress((idx + 1) / total_channels)
@@ -982,13 +999,12 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
             st.warning("No evaluations were run.")
 
     if st.session_state['sim_results'] is not None:
-        # Pass the raw dataframe to the dashboard generator
         generate_simulation_dashboards(st.session_state['sim_results'])
         
         with st.expander("View Raw Simulation Logs"):
             st.dataframe(st.session_state['sim_results'], use_container_width=True)
             
- # ---------------------------------------------------------
+# ---------------------------------------------------------
 # 7. The Main UI Function (App Router)
 # ---------------------------------------------------------
 def main():
@@ -1028,6 +1044,13 @@ def main():
         help="[Requires Simulation Re-run] ON: The confidence bands widen over time as the machine degrades (Highly realistic). OFF: The bands stay parallel to the nominal fit using the last known standard deviation."
     )
     
+    st.sidebar.markdown("### Model Override")
+    override_model = st.sidebar.toggle(
+        "Enable Manual Selection", value=False,
+        help="[Requires Simulation Re-run] Forces the dashboard to plot and simulate a specific mathematical model, ignoring the algorithm's automatic recommendation."
+    )
+    manual_model = st.sidebar.selectbox("Force specific model:", options=AVAILABLE_MODELS, disabled=not override_model)
+
     st.sidebar.markdown("### Structural Break (Model Competition)")
     break_window = st.sidebar.number_input(
         "Evaluation Window (Days)", 
@@ -1055,7 +1078,6 @@ def main():
         sorted_models = sort_items(AVAILABLE_MODELS, direction='vertical')
         user_priority_dict = {model: rank for rank, model in enumerate(sorted_models, start=1)}
 
-    # We lock max_rul globally under the hood to ensure formatting stays clean
     max_rul = 365 
 
     # =========================================================
@@ -1087,14 +1109,6 @@ def main():
             min_value=1, max_value=window_size, value=min(50, window_size), step=1,
             help="[Updates Instantly] The number of recent days used to score and rank the models. For example, setting this to 50 means the algorithm picks the model that best fits the last 50 days, even if it fits the older data poorly."
         )
-
-        st.sidebar.markdown("### 4. Model Override")
-        override_model = st.sidebar.toggle(
-            "Enable Manual Selection", value=False,
-            help="[Updates Instantly] Forces the dashboard to plot a specific mathematical model, ignoring the algorithm's automatic recommendation."
-        )
-        manual_model = st.sidebar.selectbox("Force specific model:", options=AVAILABLE_MODELS, disabled=not override_model)
-
 
         # Load Data
         sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(
@@ -1209,7 +1223,7 @@ def main():
     # =========================================================
     elif app_mode == "Live Fleet Simulation":
         page_live_simulation(
-            uploaded_file, user_priority_dict, outlier_factor, outlier_window, use_dynamic_variance, break_window, break_step, break_sustained
+            uploaded_file, user_priority_dict, outlier_factor, outlier_window, use_dynamic_variance, break_window, break_step, break_sustained, override_model, manual_model
         )
 
 if __name__ == "__main__":
