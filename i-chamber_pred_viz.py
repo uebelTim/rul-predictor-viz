@@ -708,11 +708,10 @@ def calculate_rul_headless(time_raw, sensor_smooth, sensor_raw, model_choice, th
 
     return nom_rul, upper_rul, lower_rul
 
-
 # ---------------------------------------------------------
 # NEW: The Second Page (Live Simulation)
 # ---------------------------------------------------------
-def page_live_simulation(uploaded_file, global_slope, priority_dict, outlier_factor, outlier_window, use_dynamic_variance):
+def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_window, use_dynamic_variance):
     st.title("Fleet-Wide Live Simulation")
     st.markdown("Run the predictive engine across all channels and all historical timesteps to generate statistical confidence metrics.")
     
@@ -805,9 +804,6 @@ def page_live_simulation(uploaded_file, global_slope, priority_dict, outlier_fac
         st.markdown("---")
         st.markdown("### Raw Simulation Logs")
         st.dataframe(st.session_state['sim_results'], use_container_width=True)
-        # We will build the Plotly charts here next!
-        
-        
         
 # ---------------------------------------------------------
 # 7. The Main UI Function (App Router)
