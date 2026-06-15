@@ -716,7 +716,7 @@ def calculate_rul_headless(time_raw, sensor_smooth, sensor_raw, model_choice, th
 def generate_simulation_dashboards(raw_df):
     """
     Applies the dynamic Action Window to the raw simulation data, 
-    then generates Chart A (Heatmap), Chart B (Scatter), and Chart C (Bias).
+    then generates Chart A (Status Heatmap), Chart B (Bias Heatmap), Chart C (Scatter), and Chart D (Bias Bar).
     """
     df = raw_df.copy() # Protect the original session state data
 
@@ -728,7 +728,7 @@ def generate_simulation_dashboards(raw_df):
     action_window = st.slider(
         "Action Window (Days)", 
         min_value=5, max_value=90, value=30, step=1,
-        help="Instantly recalculates the dashboard. 'Is the machine going to cross the threshold in the next X days?'"
+        help="[Updates Instantly] Defines your operational horizon. This window is used to calculate the True/False Positives and Negatives. If the algorithm predicts a failure inside this window, it is a 'Positive'. If the actual failure happens inside this window, it is a 'True Positive'. Otherwise, it flags a False Positive (False Alarm) or False Negative (Missed Failure)."
     )
 
     # 2. VECTORIZED POST-PROCESSING (Lightning Fast)
@@ -746,27 +746,31 @@ def generate_simulation_dashboards(raw_df):
     df['Bias_Score'] = np.clip((error + action_window) / (action_window * 2), 0.0, 1.0)
 
 
-    # --- CHART A: Lifecycle Confusion Heatmap ---
-    st.subheader("Chart A: Lifecycle Confusion Matrix (Timeline)")
-    
-    status_map = {"True Negative": 0, "False Positive": 1, "True Positive": 2, "False Negative": 3}
-    df['Status_Code'] = df['Status'].map(status_map)
+    # --- SHARED HOVER DATA PREPARATION ---
     df['Eval_Day_Rounded'] = df['Evaluation_Day'].round().astype(int)
     
     # Format RULs for hover tooltips (Handling NaNs gracefully)
     df['Hover_Pred'] = df['Nominal_RUL'].apply(lambda x: f"{x:.1f} Days" if pd.notna(x) else "Safe/Unknown")
     df['Hover_Act'] = df['Actual_RUL'].apply(lambda x: f"{x:.1f} Days" if pd.notna(x) else "Never Breaches")
     
-    # Create pivot tables for the Z-axis (Colors) and CustomData (Hover text)
-    pivot_status_code = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status_Code', aggfunc='first')
-    pivot_status_text = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status', aggfunc='first')
     pivot_pred = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Pred', aggfunc='first')
     pivot_act = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Act', aggfunc='first')
+
+
+    # ==========================================
+    # CHART A: Lifecycle Confusion Heatmap
+    # ==========================================
+    st.subheader("Chart A: Lifecycle Confusion Matrix (Categorical)")
     
-    # Stack the hover data together
-    customdata = np.dstack((pivot_status_text.values, pivot_pred.values, pivot_act.values))
+    status_map = {"True Negative": 0, "False Positive": 1, "True Positive": 2, "False Negative": 3}
+    df['Status_Code'] = df['Status'].map(status_map)
     
-    colorscale = [
+    pivot_status_code = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status_Code', aggfunc='first')
+    pivot_status_text = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status', aggfunc='first')
+    
+    customdata_a = np.dstack((pivot_status_text.values, pivot_pred.values, pivot_act.values))
+    
+    colorscale_a = [
         [0.0, '#E8F5E9'], # 0: True Negative (Light Green)
         [0.33, '#FFB74D'], # 1: False Positive (Orange)
         [0.66, '#4CAF50'], # 2: True Positive (Dark Green)
@@ -774,96 +778,98 @@ def generate_simulation_dashboards(raw_df):
     ]
 
     fig_a = go.Figure()
-    
-    # Add the main Heatmap
     fig_a.add_trace(go.Heatmap(
-        z=pivot_status_code.values,
-        x=pivot_status_code.columns,
-        y=pivot_status_code.index,
-        colorscale=colorscale,
-        zmin=0, zmax=3,
-        showscale=False,
-        hoverongaps=False,
-        customdata=customdata,
+        z=pivot_status_code.values, x=pivot_status_code.columns, y=pivot_status_code.index,
+        colorscale=colorscale_a, zmin=0, zmax=3, showscale=False, hoverongaps=False, customdata=customdata_a,
         hovertemplate="<b>Day:</b> %{x}<br><b>Channel:</b> %{y}<br><b>Result:</b> %{customdata[0]}<br><b>Predicted:</b> %{customdata[1]}<br><b>Actual:</b> %{customdata[2]}<extra></extra>"
     ))
     
-    # Add "Dummy" invisible traces just to force Plotly to render a Legend
-    legend_items = [
-        ("True Negative (Safe)", '#E8F5E9'),
-        ("False Positive (Early Alarm)", '#FFB74D'),
-        ("True Positive (Good Catch)", '#4CAF50'),
-        ("False Negative (Missed Break)", '#F44336')
-    ]
-    for name, color in legend_items:
+    # Dummy traces for the Legend
+    for name, color in [("True Negative (Safe)", '#E8F5E9'), ("False Positive (Early Alarm)", '#FFB74D'), 
+                        ("True Positive (Good Catch)", '#4CAF50'), ("False Negative (Missed Break)", '#F44336')]:
         fig_a.add_trace(go.Scatter(
             x=[None], y=[None], mode='markers',
-            marker=dict(size=15, color=color, symbol='square', line=dict(color='black', width=1)),
-            name=name
+            marker=dict(size=15, color=color, symbol='square', line=dict(color='black', width=1)), name=name
         ))
 
     fig_a.update_layout(
-        xaxis_title="Simulation Day", yaxis_title="Channel",
-        height=450, template="plotly_white", margin=dict(t=30, b=30),
+        xaxis_title="Simulation Day", yaxis_title="Channel", height=400, template="plotly_white", margin=dict(t=30, b=30),
         legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5, title=None)
     )
     st.plotly_chart(fig_a, use_container_width=True)
 
 
-    # --- CHART B & C Layout ---
+    # ==========================================
+    # CHART B: Directional Bias Heatmap
+    # ==========================================
+    st.subheader("Chart B: Directional Bias Matrix (Continuous)")
+    st.markdown(f"*(Dark = >{action_window} Days Early | Orange = Perfect | Yellow = >{action_window} Days Late)*")
+    
+    pivot_bias = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Bias_Score', aggfunc='first')
+    
+    df['Hover_Bias'] = df['Bias_Score'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
+    pivot_bias_text = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Bias', aggfunc='first')
+    
+    customdata_b = np.dstack((pivot_bias_text.values, pivot_pred.values, pivot_act.values))
+    
+    fig_b = go.Figure(data=go.Heatmap(
+        z=pivot_bias.values, x=pivot_bias.columns, y=pivot_bias.index,
+        colorscale='Magma', zmin=0.0, zmax=1.0, showscale=True, hoverongaps=False, customdata=customdata_b,
+        colorbar=dict(title="Bias Score", tickvals=[0, 0.5, 1], ticktext=["0.0 (Early)", "0.5", "1.0 (Late)"]),
+        hovertemplate="<b>Day:</b> %{x}<br><b>Channel:</b> %{y}<br><b>Bias Score:</b> %{customdata[0]}<br><b>Predicted:</b> %{customdata[1]}<br><b>Actual:</b> %{customdata[2]}<extra></extra>"
+    ))
+    
+    fig_b.update_layout(xaxis_title="Simulation Day", yaxis_title="Channel", height=400, template="plotly_white", margin=dict(t=30, b=30))
+    st.plotly_chart(fig_b, use_container_width=True)
+
+
+    # ==========================================
+    # CHART C & D: Aggregated Views
+    # ==========================================
     col1, col2 = st.columns(2)
     df_valid = df.dropna(subset=['Actual_RUL', 'Nominal_RUL']).copy()
 
     with col1:
-        st.subheader("Chart B: Prediction Scatter")
+        st.subheader("Chart C: Prediction Scatter")
         if not df_valid.empty:
             max_val = max(df_valid['Actual_RUL'].max(), df_valid['Nominal_RUL'].max()) * 1.1
             
-            fig_b = px.scatter(
+            fig_c = px.scatter(
                 df_valid, x="Actual_RUL", y="Nominal_RUL", color="Status", 
                 hover_data=["Channel", "Evaluation_Day"],
-                color_discrete_map={
-                    "True Positive": "#4CAF50", "False Positive": "#FFB74D",
-                    "True Negative": "#E8F5E9", "False Negative": "#F44336"
-                }
+                color_discrete_map={"True Positive": "#4CAF50", "False Positive": "#FFB74D", "True Negative": "#E8F5E9", "False Negative": "#F44336"}
             )
-            # Perfect prediction diagonal & Action Window boundaries
-            fig_b.add_trace(go.Scatter(x=[0, max_val], y=[0, max_val], mode='lines', name='Perfect Prediction', line=dict(color='black', dash='dash')))
-            fig_b.add_vline(x=action_window, line_width=1, line_dash="dot", line_color="gray", annotation_text="Action Window", annotation_position="top left")
-            fig_b.add_hline(y=action_window, line_width=1, line_dash="dot", line_color="gray")
+            fig_c.add_trace(go.Scatter(x=[0, max_val], y=[0, max_val], mode='lines', name='Perfect Prediction', line=dict(color='black', dash='dash')))
+            fig_c.add_vline(x=action_window, line_width=1, line_dash="dot", line_color="gray", annotation_text="Action Window", annotation_position="top left")
+            fig_c.add_hline(y=action_window, line_width=1, line_dash="dot", line_color="gray")
             
-            fig_b.update_layout(
+            fig_c.update_layout(
                 xaxis_title="Actual RUL (Days)", yaxis_title="Predicted RUL (Days)",
                 xaxis=dict(range=[0, max_val]), yaxis=dict(range=[0, max_val]),
-                height=500, template="plotly_white",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                height=450, template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
-            st.plotly_chart(fig_b, use_container_width=True)
+            st.plotly_chart(fig_c, use_container_width=True)
         else:
             st.info("No threshold crossings occurred in the historical data to scatter.")
 
     with col2:
-        st.subheader("Chart C: Directional Bias by Channel")
-        st.markdown(f"*(0.0 = >{action_window} Days Early | 0.5 = Perfect | 1.0 = >{action_window} Days Late)*")
+        st.subheader("Chart D: Average Directional Bias")
         if not df_valid.empty:
-            bias_summary = df_valid.groupby('Channel')['Bias_Score'].mean().reset_index()
-            bias_summary = bias_summary.sort_values(by='Bias_Score')
+            bias_summary = df_valid.groupby('Channel')['Bias_Score'].mean().reset_index().sort_values(by='Bias_Score')
             
-            fig_c = px.bar(
-                bias_summary, x="Bias_Score", y="Channel", orientation='h',
-                color="Bias_Score",
-                color_continuous_scale=["#2196F3", "#4CAF50", "#F44336"],
-                range_color=[0, 1]
+            fig_d = px.bar(
+                bias_summary, x="Bias_Score", y="Channel", orientation='h', color="Bias_Score",
+                color_continuous_scale="Magma", range_color=[0, 1]
             )
-            fig_c.add_vline(x=0.5, line_width=2, line_dash="dash", line_color="black")
-            fig_c.update_layout(
+            fig_d.add_vline(x=0.5, line_width=2, line_dash="dash", line_color="black")
+            fig_d.update_layout(
                 xaxis_title="Average Bias Score", yaxis_title="Channel",
-                xaxis=dict(range=[0, 1]), height=500, template="plotly_white",
-                coloraxis_colorbar=dict(title="Bias")
+                xaxis=dict(range=[0, 1]), height=450, template="plotly_white", coloraxis_colorbar=dict(title="Bias")
             )
-            st.plotly_chart(fig_c, use_container_width=True)
+            st.plotly_chart(fig_d, use_container_width=True)
         else:
             st.info("Not enough failure data to calculate bias scores.")
+            
             
 # ---------------------------------------------------------
 # NEW: The Second Page (Live Simulation)
@@ -962,8 +968,7 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
         with st.expander("View Raw Simulation Logs"):
             st.dataframe(st.session_state['sim_results'], use_container_width=True)
             
-            
-# ---------------------------------------------------------
+ # ---------------------------------------------------------
 # 7. The Main UI Function (App Router)
 # ---------------------------------------------------------
 def main():
@@ -989,25 +994,25 @@ def main():
     outlier_factor = st.sidebar.slider(
         "IQR Outlier Factor", 
         min_value=0.5, max_value=10.0, value=3.0, step=0.1, 
-        help="How aggressively to flatten spikes in the raw data. 1.5 is standard statistical filtering; 3.0 only removes extreme, impossible anomalies."
+        help="[Requires Simulation Re-run] How aggressively to flatten spikes in the raw data. 1.5 is standard statistical filtering; 3.0 only removes extreme, impossible anomalies."
     )
     outlier_window = st.sidebar.number_input(
         "Rolling Window (4h Periods)", 
         min_value=5, max_value=200, value=42, step=1,
-        help="NOTE: This filter cleans the raw data BEFORE it is compressed into daily averages. Because the raw data arrives in 4-hour intervals, setting this to 42 periods equals exactly 7 days of local context."
+        help="[Requires Simulation Re-run] NOTE: This filter cleans the raw data BEFORE it is compressed into daily averages. Because the raw data arrives in 4-hour intervals, setting this to 42 periods equals exactly 7 days of local context."
     )
     
     st.sidebar.markdown("### Variance Configuration")
     use_dynamic_variance = st.sidebar.toggle(
         "Use Dynamic Variance (Linear Fit)", value=True, 
-        help="ON: The confidence bands widen over time as the machine degrades (Highly realistic). OFF: The bands stay parallel to the nominal fit using the last known standard deviation."
+        help="[Requires Simulation Re-run] ON: The confidence bands widen over time as the machine degrades (Highly realistic). OFF: The bands stay parallel to the nominal fit using the last known standard deviation."
     )
     
     st.sidebar.markdown("### Structural Break (Model Competition)")
     break_window = st.sidebar.number_input(
         "Evaluation Window (Days)", 
         min_value=10, max_value=200, value=60, step=10,
-        help="The chunk of days analyzed at one time to check if the data is bending. A wider window prevents false alarms from noisy data, but might detect the actual break a few days later."
+        help="[Requires Simulation Re-run] The chunk of days analyzed at one time to check if the data is bending. A wider window prevents false alarms from noisy data, but might detect the actual break a few days later."
     )
     
     col_s, col_t = st.sidebar.columns(2)
@@ -1015,13 +1020,13 @@ def main():
         break_step = st.number_input(
             "Step Size (Days)", 
             min_value=1, max_value=30, value=7, step=1,
-            help="How many days the detector jumps forward between checks. Setting this to 7 means the algorithm checks for a structural break once a week."
+            help="[Requires Simulation Re-run] How many days the detector jumps forward between checks. Setting this to 7 means the algorithm checks for a structural break once a week."
         )
     with col_t:
         break_sustained = st.number_input(
             "Sustained Wins", 
             min_value=1, max_value=10, value=2, step=1,
-            help="The failsafe mechanism. The Exponential model must beat the Linear model this many consecutive times before the 'Structural Break' alarm triggers. Prevents false positives."
+            help="[Requires Simulation Re-run] The failsafe mechanism. The Exponential model must beat the Linear model this many consecutive times before the 'Structural Break' alarm triggers. Prevents false positives."
         )
 
     st.sidebar.markdown("### Router Priority Ranking")
@@ -1054,19 +1059,19 @@ def main():
         window_size = st.sidebar.number_input(
             "2. Window Size (Lookback Days)", 
             min_value=10, max_value=5000, value=300, step=10,
-            help="The total number of trailing days used to calculate the predictive curves. A larger window provides more historical stability, while a shorter window reacts faster to recent changes."
+            help="[Updates Instantly] The total number of trailing days used to calculate the predictive curves. A larger window provides more historical stability, while a shorter window reacts faster to recent changes."
         )
         
         eval_window = st.sidebar.number_input(
             "3. MSE Eval Window (Last N Days)", 
             min_value=1, max_value=window_size, value=min(50, window_size), step=1,
-            help="The number of recent days used to score and rank the models. For example, setting this to 50 means the algorithm picks the model that best fits the last 50 days, even if it fits the older data poorly."
+            help="[Updates Instantly] The number of recent days used to score and rank the models. For example, setting this to 50 means the algorithm picks the model that best fits the last 50 days, even if it fits the older data poorly."
         )
 
         st.sidebar.markdown("### 4. Model Override")
         override_model = st.sidebar.toggle(
             "Enable Manual Selection", value=False,
-            help="Forces the dashboard to plot a specific mathematical model, ignoring the algorithm's automatic recommendation."
+            help="[Updates Instantly] Forces the dashboard to plot a specific mathematical model, ignoring the algorithm's automatic recommendation."
         )
         manual_model = st.sidebar.selectbox("Force specific model:", options=AVAILABLE_MODELS, disabled=not override_model)
 
