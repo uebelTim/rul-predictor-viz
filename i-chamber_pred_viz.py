@@ -828,7 +828,7 @@ def generate_simulation_dashboards(raw_df):
         f"Cells where the threshold is never crossed use the {RUL_HORIZON}-day horizon, so algorithm behaviour is still visualized.)*"
     )
 
-    rocket_palette = sns.color_palette("rocket", n_colors=256).as_hex()
+    rocket_palette = sns.color_palette("flare", n_colors=256).as_hex()
     pivot_bias = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Bias_Score', aggfunc='first')
 
     # Richer hover: bias + whether the actual ever crossed.
