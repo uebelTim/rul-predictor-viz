@@ -928,7 +928,7 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
 
         for idx, channel in enumerate(channels):
             # Update Overall Fleet UI
-            status_text.markdown(f"**Overall Fleet Progress:** Processing Channel **/{channel}/** ({idx + 1} / {total_channels})")
+            status_text.markdown(f"**Overall Fleet Progress:** Processing Channel **{channel}** ({idx + 1} / {total_channels})")
             sub_status_text.markdown(f"Initializing data for Channel `{channel}`...")
             sub_progress_bar.progress(0.0)
             
