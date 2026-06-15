@@ -7,43 +7,38 @@ import plotly.graph_objects as go
 import streamlit as st
 from streamlit_sortables import sort_items 
 
-def filter_outliers_quantile(df, factor=1.5, keep_nans=True):
+
+def rolling_iqr_filter(data, window=20, factor=1.5, center=True, keep_nans=True):
     """
-    Filter out outliers from a DataFrame using the Interquartile Range (IQR) method.
-    'factor' is typically 1.5 for outliers and 3.0 for extreme outliers.
-    'keep_nans' if True, preserves original NaN positions after interpolation.
+    Filter out outliers using a Local Windowed Interquartile Range (IQR) method.
+    Automatically handles both Pandas Series and DataFrames.
     """
-    # Force numeric types
-    df_numeric = df.apply(pd.to_numeric, errors='coerce')
+    def _filter_series(series):
+        s = pd.to_numeric(series, errors='coerce')
+        original_nans = s.isna()
 
-    # Snapshot original NaN positions before any processing
-    original_nans = df_numeric.isna()
+        Q1 = s.rolling(window=window, center=center, min_periods=1).quantile(0.25)
+        Q3 = s.rolling(window=window, center=center, min_periods=1).quantile(0.75)
+        IQR = Q3 - Q1
 
-    # Calculate quartiles and IQR
-    Q1 = df_numeric.quantile(0.25)
-    Q3 = df_numeric.quantile(0.75)
-    IQR = Q3 - Q1
+        lower_bound = Q1 - (factor * IQR)
+        upper_bound = Q3 + (factor * IQR)
 
-    # Define bounds
-    lower_bound = Q1 - (factor * IQR)
-    upper_bound = Q3 + (factor * IQR)
+        mask = (s >= lower_bound) & (s <= upper_bound)
+        s_filtered = s.where(mask, np.nan)
+        s_filtered = s_filtered.interpolate(method='linear', limit_direction='both')
 
-    # Replace outliers with NaN
-    mask = (df_numeric >= lower_bound) & (df_numeric <= upper_bound)
-    df_filtered = df_numeric.where(mask, np.nan)
+        if keep_nans:
+            s_filtered[original_nans] = np.nan
 
-    # Interpolate over outlier positions (not original NaNs)
-    df_filtered = df_filtered.interpolate(method='linear', limit_direction='both')
+        return s_filtered
 
-    # Interpolate over axis=1 if still NaN values
-    if df_filtered.isnull().values.any():
-        df_filtered = df_filtered.interpolate(method='linear', axis=1, limit_direction='both')
-
-    # Restore original NaN positions
-    if keep_nans:
-        df_filtered[original_nans] = np.nan
-
-    return df_filtered
+    if isinstance(data, pd.Series):
+        return _filter_series(data)
+    elif isinstance(data, pd.DataFrame):
+        return data.apply(_filter_series)
+    else:
+        raise TypeError(f"Expected pd.Series or pd.DataFrame, got {type(data)}")
 
 # ---------------------------------------------------------
 # 1. The Standardized Mathematical Models
@@ -168,10 +163,6 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
 # 3. Structural Break Detector (Model Competition)
 # ---------------------------------------------------------
 def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_wins=2):
-    """
-    Detects a structural break by sliding a window across the data and comparing 
-    the AIC score of a Linear Model vs. a Shifted Exponential Model.
-    """
     time_arr = np.asarray(time_arr, dtype=float)
     sensor_arr = np.asarray(sensor_arr, dtype=float)
     
@@ -586,32 +577,7 @@ def get_available_channels(file_obj):
 
 
 @st.cache_data
-def calculate_global_baseline_slope(file_obj, baseline_pct=0.20):
-    file_obj.seek(0)
-    df = pd.read_csv(file_obj, parse_dates=['DateTime'])
-    df.set_index('DateTime', inplace=True)
-    df = df[~df.index.duplicated(keep='first')]
-    
-    df_daily = df.resample('D').mean(numeric_only=True)
-    
-    cols = [c for c in df_daily.columns if 'Error' not in c and c != 'Thermo_Valve_Temperature_DeviationPct']
-    global_mean = df_daily[cols].mean(axis=1).bfill().ffill()
-    
-    n_base = max(5, int(len(global_mean) * baseline_pct))
-    y_base = global_mean.iloc[:n_base].values
-    
-    t_base = (global_mean.index[:n_base] - global_mean.index[0]).days.values
-    
-    if len(t_base) > 1:
-        slope, _ = np.polyfit(t_base, y_base, 1)
-    else:
-        slope = 0.0
-        
-    return slope
-
-
-@st.cache_data
-def load_my_sensor_data(file_obj, col='32', outlier_factor=3.0):
+def load_my_sensor_data(file_obj, col='32', outlier_factor=3.0, outlier_window=42):
     freq = '4h'
     column_names=[]
     
@@ -630,8 +596,9 @@ def load_my_sensor_data(file_obj, col='32', outlier_factor=3.0):
     df_select = df[cols]
     df_select = df_select.interpolate(method='time', limit=1)
     
-    # Run the outlier filter with the user's dynamic factor
-    df_select = filter_outliers_quantile(df_select, factor=outlier_factor)
+    # Run the windowed outlier filter with the user's dynamic variables
+    # New code using your robust rolling_iqr_filter
+    df_select = rolling_iqr_filter(df_select, factor=outlier_factor, window=outlier_window)
         
     df_defect = df_select
     window = int(1*24/4) 
@@ -685,12 +652,16 @@ def main():
         sorted_models = sort_items(AVAILABLE_MODELS, direction='vertical')
         user_priority_dict = {model: rank for rank, model in enumerate(sorted_models, start=1)}
 
-    # NEW: Replaced Display Limits with Outlier Filtering slider
     st.sidebar.markdown("### 6. Outlier Filtering")
     outlier_factor = st.sidebar.slider(
         "IQR Outlier Factor", 
         min_value=0.5, max_value=10.0, value=3.0, step=0.1, 
         help="Multiplier for the Interquartile Range. Lower values aggressively filter out peaks, higher values keep them intact. 1.5 is standard, 3.0 is for extreme outliers."
+    )
+    outlier_window = st.sidebar.number_input(
+        "Rolling Window (Periods)", 
+        min_value=5, max_value=200, value=42, step=1,
+        help="Number of data points used to calculate the local IQR. At 4h intervals, 42 periods = 7 days. A smaller window tracks sudden baseline shifts better but might filter out valid normal operations."
     )
     # Lock max_rul globally under the hood to ensure formatting stays clean
     max_rul = 365 
@@ -719,8 +690,8 @@ def main():
             help="The failsafe. The exponential model must beat the linear model this many consecutive times to officially trigger the 'Structural Break' alarm. Prevents false positives from random data spikes."
         )
 
-    # 1. Load Data (Now passing the outlier factor)
-    sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(uploaded_file, col=selected_col, outlier_factor=outlier_factor)
+    # 1. Load Data
+    sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(uploaded_file, col=selected_col, outlier_factor=outlier_factor, outlier_window=outlier_window)
     
     # 2. GLOBAL STRUCTURAL BREAK DETECTION
     break_idx, break_time = detect_structural_break(
