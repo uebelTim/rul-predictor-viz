@@ -916,12 +916,21 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
         channels = get_available_channels(uploaded_file)
         results_list = []
         
-        progress_bar = st.progress(0.0)
+        # --- UI Elements for Dual Progress Tracking ---
+        st.markdown("#### Simulation Progress")
         status_text = st.empty()
+        progress_bar = st.progress(0.0)
+        
+        sub_status_text = st.empty()
+        sub_progress_bar = st.progress(0.0)
+        
         total_channels = len(channels)
 
         for idx, channel in enumerate(channels):
-            status_text.text(f"Processing Channel {channel} ({idx + 1} / {total_channels})...")
+            # Update Overall Fleet UI
+            status_text.markdown(f"**Overall Fleet Progress:** Processing Channel `{channel}` ({idx + 1} / {total_channels})")
+            sub_status_text.markdown(f"Initializing data for Channel `{channel}`...")
+            sub_progress_bar.progress(0.0)
             
             sensor_smooth, sensor_raw, time_arr = load_my_sensor_data(
                 uploaded_file, col=channel, outlier_factor=outlier_factor, outlier_window=outlier_window
@@ -938,19 +947,37 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
             )
             
             start_idx = 50 
-            if req_break and break_idx is not None: start_idx = max(50, break_idx)
-            elif req_break and break_idx is None: continue 
+            if req_break and break_idx is not None: 
+                start_idx = max(50, break_idx)
+            elif req_break and break_idx is None: 
+                # Handle skipped channels cleanly in the UI
+                sub_status_text.markdown(f"⏭️ *Skipping Channel `{channel}` (No Structural Break detected).*")
+                sub_progress_bar.progress(1.0)
+                progress_bar.progress((idx + 1) / total_channels)
+                continue 
                 
             max_idx = len(time_arr)
+            timesteps = list(range(start_idx, max_idx, step_days))
+            total_steps = len(timesteps)
             
-            for current_cutoff in range(start_idx, max_idx, step_days):
+            if total_steps == 0:
+                sub_status_text.markdown(f"⏭️ *Skipping Channel `{channel}` (Not enough historical data).*")
+                sub_progress_bar.progress(1.0)
+                progress_bar.progress((idx + 1) / total_channels)
+                continue
+
+            # --- INNER TIMESTEP LOOP ---
+            for step_idx, current_cutoff in enumerate(timesteps):
                 hist_time = time_arr_np[:current_cutoff]
                 hist_smooth = smooth_np[:current_cutoff]
                 hist_raw = np.asarray(sensor_raw, dtype=float)[:current_cutoff]
                 
                 current_day = hist_time[-1]
                 
-                # --- Get all MSE scores for the logs ---
+                # Update Sub-Progress UI
+                sub_status_text.markdown(f"↳ Evaluating Timestep **{step_idx + 1} / {total_steps}** (Day {current_day:.1f})")
+                
+                # Get all MSE scores for the logs
                 eval_win = min(50, len(hist_time))
                 top_models, all_models = evaluate_all_models(
                     hist_time, hist_smooth, priority_ranking=priority_dict, eval_window=eval_win, plot=False, verbose=False
@@ -960,7 +987,7 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                 if all_models:
                     mse_log_str = " | ".join([f"{k}: {v['mse']:.5f}" for k, v in all_models.items() if v.get('mse', float('inf')) != float('inf')])
                 
-                # --- Apply the Model Override ---
+                # Apply the Model Override
                 if override_model:
                     best_model = manual_model
                 else:
@@ -975,8 +1002,12 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                 )
                 
                 actual_rul = actual_crossing_day - current_day if not np.isnan(actual_crossing_day) else np.nan
+                
+                # Fill inner progress bar
+                sub_progress_bar.progress((step_idx + 1) / total_steps)
+
                 if not np.isnan(actual_rul) and actual_rul < 0:
-                    continue # Skip evaluations if the machine has already broken
+                    continue # Skip logging evaluations if the machine has already broken
 
                 results_list.append({
                     'Channel': channel,
@@ -989,9 +1020,13 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                     'All_Models_MSE': mse_log_str 
                 })
             
+            # Channel is fully evaluated, update overall progress
             progress_bar.progress((idx + 1) / total_channels)
 
         status_text.success("✅ Fleet Simulation Complete!")
+        # Erase the inner progress tracker so the UI is clean when finished
+        sub_status_text.empty()
+        sub_progress_bar.empty()
         
         if results_list:
             st.session_state['sim_results'] = pd.DataFrame(results_list)
