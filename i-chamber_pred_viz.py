@@ -993,13 +993,19 @@ def generate_simulation_dashboards(raw_df):
         fig_c.update_layout(
             xaxis_title=x_title,
             yaxis_title=f"Predicted RUL (Days, capped @ {display_horizon})",
-            xaxis=dict(range=[0, x_view_max]), yaxis=dict(range=[0, y_view_max]),
-            height=600, template="plotly_white",
+            xaxis=dict(range=[0, x_view_max]), 
+            yaxis=dict(range=[0, y_view_max]),
+            width=800,   # <-- Force width
+            height=800,  # <-- Force height to match width
+            template="plotly_white",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
-        st.plotly_chart(fig_c, use_container_width=True)
-    else:
-        st.info("No simulation data available for this view.")
+        
+        # Center the square chart nicely on the page
+        col_left, col_center, col_right = st.columns([1, 3, 1])
+        with col_center:
+            # use_container_width=False stops Streamlit from stretching the square into a rectangle
+            st.plotly_chart(fig_c, use_container_width=False)
 
 
 
