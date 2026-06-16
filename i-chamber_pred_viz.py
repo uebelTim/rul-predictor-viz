@@ -958,7 +958,9 @@ def generate_simulation_dashboards(raw_df):
             xaxis_title="Actual RUL (Days, uncapped)",
             yaxis_title=f"Predicted RUL (Days, capped @ {display_horizon})",
             xaxis=dict(range=[0, x_view_max]), yaxis=dict(range=[0, y_view_max]),
-            height=600, template="plotly_white",
+            height=800,
+            width =800,
+            template="plotly_white",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
         st.plotly_chart(fig_c, use_container_width=True)
