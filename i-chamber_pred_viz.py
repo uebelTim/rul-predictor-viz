@@ -776,11 +776,6 @@ def generate_simulation_dashboards(raw_df):
     st.header("📊 Fleet Backtesting Results")
 
     st.markdown("### Operational Thresholds")
-    action_window = st.slider(
-        "Action Window (Days)", min_value=5, max_value=90, value=30, step=1,
-        help="[Updates Instantly] Defines your operational horizon. Used to calculate True/False Positives."
-    )
-    st.markdown("### Operational Thresholds")
     col_aw, col_hz = st.columns(2)
     with col_aw:
         action_window = st.slider(
