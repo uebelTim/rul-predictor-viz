@@ -888,7 +888,7 @@ def generate_simulation_dashboards(raw_df):
         f"safe horizon, so the algorithm's behaviour remains visible rather than blank."
     )
 
-    rocket_palette = sns.color_palette("rocket", n_colors=256).as_hex()
+    rocket_palette = sns.color_palette("mako", n_colors=256).as_hex()
     pivot_bias = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Bias_Score', aggfunc='first')
 
     df['Hover_Bias'] = df['Bias_Score'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
