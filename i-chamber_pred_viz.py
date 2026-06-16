@@ -990,22 +990,36 @@ def generate_simulation_dashboards(raw_df):
         else:
             x_title = "Actual outcome (Days; safe cases grouped at right)"
 
+               # 1. Find the absolute maximum between X and Y so both axes share the same scale
+        max_range = max(x_view_max, y_view_max)
+
         fig_c.update_layout(
             xaxis_title=x_title,
             yaxis_title=f"Predicted RUL (Days, capped @ {display_horizon})",
-            xaxis=dict(range=[0, x_view_max]), 
-            yaxis=dict(range=[0, y_view_max]),
-            width=800,   # <-- Force width
-            height=800,  # <-- Force height to match width
+            
+            # 2. Apply the identical range and lock the physical aspect ratio to 1:1
+            xaxis=dict(range=[0, max_range]), 
+            yaxis=dict(
+                range=[0, max_range], 
+                scaleanchor="x",  # Locks Y axis physical pixels to X axis
+                scaleratio=1      # 1:1 aspect ratio
+            ),
+            
+            width=800,
+            height=800,
+            
+            # 3. Add explicit symmetric margins to prevent uneven squeezing
+            margin=dict(l=80, r=80, t=100, b=80),
+            
             template="plotly_white",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
-        
+
         # Center the square chart nicely on the page
         col_left, col_center, col_right = st.columns([1, 3, 1])
         with col_center:
-            # use_container_width=False stops Streamlit from stretching the square into a rectangle
             st.plotly_chart(fig_c, use_container_width=False)
+
 
 
 
