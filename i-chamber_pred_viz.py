@@ -267,17 +267,46 @@ def solve_rul_root(func, params, target_val, t_max, get_dynamic_std,
         return None
 
 
-# ---------------------------------------------------------
-# 3. Structural Break Detector (Model Competition)
-# ---------------------------------------------------------
 def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_wins=2,
-                            maxfev=2000):
+                            maxfev=2000, eval_lookback=None):
+    """
+    Detects a structural break via sustained Exponential-vs-Linear model competition.
+
+    Marker placement:
+        The break is reported at the DETECTION point `i` (the window that confirmed
+        the sustained streak), NOT the rewound start of the first window. The old
+        `i - (sustained_wins-1)*step` reference labeled the break up to ~window-length
+        too early, which reviewers saw as the marker sitting visibly in front of the
+        actual bend. Reporting `i` is causally honest: we only claim a break once the
+        detector had enough evidence (sustained_wins consecutive wins).
+
+    Evaluation look-back:
+        For the simulation we usually WANT to start evaluating slightly before the
+        confirmed point, to capture the run-up into the break. `eval_lookback`
+        (in array steps, i.e. days here) is subtracted from the detection index to
+        produce `eval_start_idx`. If None, it defaults to (sustained_wins-1)*step,
+        i.e. roughly the span of the first window in the winning streak.
+
+    Returns
+    -------
+    trigger_idx : int or None
+        Confirmed detection index (clamped to >= 0). Use this for the GRAPH MARKER.
+    break_time : float or None
+        time_arr at trigger_idx (the marker's x position).
+    eval_start_idx : int or None
+        Suggested index to BEGIN EVALUATION (trigger_idx - eval_lookback, clamped).
+        Lets the simulation look back into the run-up while the marker stays at `i`.
+    """
     time_arr = np.asarray(time_arr, dtype=float)
     sensor_arr = np.asarray(sensor_arr, dtype=float)
 
-    if len(sensor_arr) < window:
-        return None, None
+    if eval_lookback is None:
+        eval_lookback = (sustained_wins - 1) * step
 
+    if len(sensor_arr) < window:
+        return None, None, None
+
+    # Smooth with an EWMA so the model competition isn't dominated by point noise.
     smooth_sensor = pd.Series(sensor_arr).ewm(span=5, adjust=False, ignore_na=True).mean().values
 
     consecutive_exp_wins = 0
@@ -295,6 +324,7 @@ def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_w
         t_win = t_win_raw[valid]
         y_win = y_win_raw[valid]
 
+        # Local normalization so fits are well-conditioned per window.
         t_min, t_max = t_win[0], t_win[-1]
         t_norm = (t_win - t_min) / (t_max - t_min) if t_max > t_min else t_win - t_min
 
@@ -309,7 +339,7 @@ def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_w
             preds_lin = linear_model(t_norm, *popt_lin)
             mse_lin = mean_squared_error(y_win, preds_lin)
             aic_lin = n * np.log(mse_lin + 1e-10) + 2 * 2
-        except Exception:  # ROBUSTNESS: no bare except
+        except Exception:  # no bare except
             aic_lin = float('inf')
 
         # --- Fit Exponential Model ---
@@ -322,21 +352,26 @@ def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_w
             preds_exp = shifted_exponential_model(t_norm, *popt_exp)
             mse_exp = mean_squared_error(y_win, preds_exp)
             aic_exp = n * np.log(mse_exp + 1e-10) + 2 * 4
-        except Exception:  # ROBUSTNESS: no bare except
+        except Exception:  # no bare except
             aic_exp = float('inf')
 
+        # --- Evaluate Winner ---
         if aic_exp < aic_lin - 2.0:
             consecutive_exp_wins += 1
             if consecutive_exp_wins >= sustained_wins:
-                first_win_idx = i - (sustained_wins - 1) * step
-                trigger_idx = first_win_idx
+                # Report the DETECTION point (this confirming window), clamped.
+                trigger_idx = max(0, i)
                 break
         else:
             consecutive_exp_wins = 0
 
-    if trigger_idx is not None:
-        return trigger_idx, time_arr[trigger_idx]
-    return None, None
+    if trigger_idx is None:
+        return None, None, None
+
+    # Evaluation may begin a bit earlier than the marker to capture the run-up.
+    eval_start_idx = max(0, trigger_idx - eval_lookback)
+    return trigger_idx, time_arr[trigger_idx], eval_start_idx
+
 
 
 # ---------------------------------------------------------
@@ -997,13 +1032,17 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
             crossing_indices = np.where(smooth_np >= target_thresh)[0]
             actual_crossing_day = time_arr_np[crossing_indices[0]] if len(crossing_indices) > 0 else np.nan
 
-            break_idx, _ = detect_structural_break(
-                time_arr, sensor_smooth, window=break_window, step=break_step, sustained_wins=break_sustained
+            break_idx, _break_time, eval_start_idx = detect_structural_break(
+                time_arr, sensor_smooth, window=break_window, step=break_step,
+                sustained_wins=break_sustained
+                # eval_lookback defaults to (sustained_wins-1)*break_step;
+                # pass eval_lookback=<days> to override.
             )
 
             start_idx = 50
             if req_break and break_idx is not None:
-                start_idx = max(50, break_idx)
+                # Begin evaluation a bit early (run-up), but never before the 50-point floor.
+                start_idx = max(50, eval_start_idx)
             elif req_break and break_idx is None:
                 sub_status_text.markdown(f"⏭️ *Skipping Channel `{channel}` (No Structural Break detected).*")
                 sub_progress_bar.progress(1.0)
@@ -1208,9 +1247,11 @@ def main():
             uploaded_file, col=selected_col, outlier_factor=outlier_factor, outlier_window=outlier_window
         )
 
-        break_idx, break_time = detect_structural_break(
-            time_arr, sensor_arr_smooth, window=break_window, step=break_step, sustained_wins=break_sustained
+        break_idx, break_time, _eval_start_idx = detect_structural_break(
+            time_arr, sensor_arr_smooth, window=break_window, step=break_step,
+            sustained_wins=break_sustained
         )
+
 
         max_index = len(time_arr) - 1
         thresholds = [0.2, 0.5, 1.0]
