@@ -839,6 +839,17 @@ def generate_simulation_dashboards(raw_df):
     # CHART A: Lifecycle Confusion Heatmap
     # ==========================================
     st.subheader("Chart A: Lifecycle Confusion Matrix (Categorical)")
+    st.caption(
+    f"Each cell shows the model's classification for that day, evaluated against your "
+    f"{action_window}-day action window. "
+    f"🟩 True Positive: a failure inside the window was correctly predicted. "
+    f"🟧 False Positive: an alarm was raised, but no crossing occurred within the window. "
+    f"⬜ True Negative: no alarm was raised and none was needed. "
+    f"🟥 False Negative: an actual crossing was not predicted (the highest-risk case). "
+    f"Use the time axis to identify whether a channel is over-alarming early in its life "
+    f"and stabilising later."
+)
+
 
     status_map = {"True Negative": 0, "False Positive": 1, "True Positive": 2, "False Negative": 3}
     df['Status_Code'] = df['Status'].map(status_map)
@@ -871,10 +882,15 @@ def generate_simulation_dashboards(raw_df):
     # CHART B: Directional Bias Heatmap (now filled everywhere)
     # ==========================================
     st.subheader("Chart B: Directional Bias Matrix (Continuous)")
-    st.markdown(
-        f"*(Dark = predicted >{action_window} days **early** | Mid = on-target | Light = predicted >{action_window} days **late**. "
-        f"Cells where the threshold is never crossed use the {display_horizon}-day horizon, so algorithm behaviour is still visualized.)*"
+    st.caption(
+    f"Shows the direction of each prediction's error, not only whether it was correct. "
+    f"Dark = conservative (predicted failure earlier than it occurred — the safe side). "
+    f"Light = optimistic (predicted failure later than it occurred — the risk side). "
+    f"Mid-tone = on target. The scale saturates at ±{action_window} days (your action window). "
+    f"Channels that never cross the threshold are scored against the {RUL_HORIZON}-day "
+    f"safe horizon, so the algorithm's behaviour remains visible rather than blank."
     )
+
 
     rocket_palette = sns.color_palette("viridis", n_colors=256).as_hex()
     pivot_bias = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Bias_Score', aggfunc='first')
@@ -917,53 +933,59 @@ def generate_simulation_dashboards(raw_df):
     # Y axis: predicted stays capped at the horizon.
     # (Nominal_RUL_c was already computed above via to_horizon.)
 
-    with col1:
-        st.subheader("Chart C: Prediction Scatter")
-        if not df_scatter.empty:
-            # Bigger, decoupled window: X follows the real data, Y bounded to horizon.
-            x_view_max = max(never_pos, action_window * 2) * 1.10
-            y_view_max = display_horizon * 1.05
+        # ==========================================
+    # CHART C: Aggregated Scatter (full width, consistent with A & B)
+    #   X (Actual RUL): UNCAPPED  -> true distance to crossing
+    #   Y (Predicted RUL): CAPPED @ display_horizon
+    # ==========================================
+    st.subheader("Chart C: Prediction Scatter")
+    st.caption(
+        f"Each point is one evaluation: actual time-to-crossing (x) against the model's "
+        f"predicted RUL (y). Points on the dashed diagonal are exact. "
+        f"Above the line = optimistic (predicted more remaining life than actual); "
+        f"below the line = conservative. The x-axis is uncapped (true distance to failure), "
+        f"while the y-axis is capped at {RUL_HORIZON} days, so points toward the right that "
+        f"flatten along the top edge are cases the model classified as effectively safe. "
+        f"The right-most lane marks channels that never cross the threshold."
+    )
 
-            fig_c = px.scatter(
-                df_scatter, x="Actual_RUL_plot", y="Nominal_RUL_c", color="Status",
-                hover_data=["Channel", "Evaluation_Day", "Hover_Pred", "Hover_Act"],
-                color_discrete_map=color_map_status
-            )
+    df_scatter = df.copy()
+    real_actual_max = df_scatter['Actual_RUL'].max(skipna=True)
+    if pd.isna(real_actual_max):
+        real_actual_max = RUL_HORIZON
+    never_pos = real_actual_max * 1.15
+    df_scatter['Actual_RUL_plot'] = df_scatter['Actual_RUL'].fillna(never_pos)
 
-            # Perfect-prediction reference line (only meaningful where both axes overlap).
-            diag_max = min(x_view_max, y_view_max)
-            fig_c.add_trace(go.Scatter(
-                x=[0, diag_max], y=[0, diag_max], mode='lines',
-                name='Perfect Prediction', line=dict(color='black', dash='dash')
-            ))
+    if not df_scatter.empty:
+        x_view_max = max(never_pos, action_window * 2) * 1.10
+        y_view_max = RUL_HORIZON * 1.05
 
-            # Action-window guides.
-            fig_c.add_vline(x=action_window, line_width=1, line_dash="dot", line_color="gray")
-            fig_c.add_hline(y=action_window, line_width=1, line_dash="dot", line_color="gray")
+        fig_c = px.scatter(
+            df_scatter, x="Actual_RUL_plot", y="Nominal_RUL_c", color="Status",
+            hover_data=["Channel", "Evaluation_Day", "Hover_Pred", "Hover_Act"],
+            color_discrete_map=color_map_status
+        )
+        diag_max = min(x_view_max, y_view_max)
+        fig_c.add_trace(go.Scatter(x=[0, diag_max], y=[0, diag_max], mode='lines',
+                                   name='Perfect Prediction', line=dict(color='black', dash='dash')))
+        fig_c.add_vline(x=action_window, line_width=1, line_dash="dot", line_color="gray")
+        fig_c.add_hline(y=action_window, line_width=1, line_dash="dot", line_color="gray")
+        fig_c.add_vline(x=never_pos, line_width=1, line_dash="dashdot", line_color="lightgray")
+        fig_c.add_annotation(x=never_pos, y=y_view_max, yanchor="top", showarrow=False,
+                             text="Never crosses →", font=dict(size=11, color="gray"),
+                             xshift=-5, xanchor="right")
+        fig_c.add_hline(y=RUL_HORIZON, line_width=1, line_dash="dashdot", line_color="lightgray")
 
-            # Mark the "Never Breaches" parking lane.
-            fig_c.add_vline(x=never_pos, line_width=1, line_dash="dashdot", line_color="lightgray")
-            fig_c.add_annotation(
-                x=never_pos, y=y_view_max, yanchor="top", showarrow=False,
-                text="Never crosses →", font=dict(size=11, color="gray"), xshift=-5, xanchor="right"
-            )
-
-            # Horizon cap guide on the predicted axis.
-            fig_c.add_hline(y=display_horizon, line_width=1, line_dash="dashdot", line_color="lightgray")
-
-            fig_c.update_layout(
-                xaxis_title="Actual RUL (Days, uncapped)",
-                yaxis_title=f"Predicted RUL (Days, capped @ {display_horizon})",
-                xaxis=dict(range=[0, x_view_max]),
-                yaxis=dict(range=[0, y_view_max]),
-                height=800,  # taller window
-                width=1200,
-                template="plotly_white",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-            )
-            st.plotly_chart(fig_c, use_container_width=False)
-        else:
-            st.info("No simulation data available to scatter.")
+        fig_c.update_layout(
+            xaxis_title="Actual RUL (Days, uncapped)",
+            yaxis_title=f"Predicted RUL (Days, capped @ {RUL_HORIZON})",
+            xaxis=dict(range=[0, x_view_max]), yaxis=dict(range=[0, y_view_max]),
+            height=600, template="plotly_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        st.plotly_chart(fig_c, use_container_width=True)
+    else:
+        st.info("No simulation data available to scatter.")
 
 
 
