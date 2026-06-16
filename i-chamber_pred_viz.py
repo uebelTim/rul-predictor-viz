@@ -774,17 +774,27 @@ def generate_simulation_dashboards(raw_df):
     st.header("📊 Fleet Backtesting Results")
 
     st.markdown("### Operational Thresholds")
-    action_window = st.slider(
-        "Action Window (Days)", min_value=5, max_value=90, value=30, step=1,
-        help="[Updates Instantly] Defines your operational horizon. Used to calculate True/False Positives."
-    )
+    col_aw, col_hz = st.columns(2)
+    with col_aw:
+        action_window = st.slider(
+            "Action Window (Days)", min_value=5, max_value=90, value=30, step=1,
+            help="[Updates Instantly] Defines your operational horizon. Used to calculate True/False Positives."
+        )
+    with col_hz:
+        display_horizon = st.slider(
+            "Safe Horizon (Days)", min_value=30, max_value=730, value=RUL_HORIZON, step=5,
+            help="[Updates Instantly] Predictions beyond this are treated as 'Safe'. "
+                 "Post-processing only — no simulation re-run needed."
+        )
+
 
     # -----------------------------------------------------
     # HORIZON-CAPPED COLUMNS (continuous charts B & C only).
     # NaN actual/predicted ("never reached") -> full horizon so a position exists.
     # -----------------------------------------------------
-    df['Nominal_RUL_c'] = df['Nominal_RUL'].apply(to_horizon)
-    df['Actual_RUL_c'] = df['Actual_RUL'].apply(to_horizon)
+    # Continuous charts B & C: cap to the LIVE display horizon (no re-run).
+    df['Nominal_RUL_c'] = df['Nominal_RUL'].apply(lambda x: to_horizon(x, display_horizon))
+    df['Actual_RUL_c']  = df['Actual_RUL'].apply(lambda x: to_horizon(x, display_horizon))
 
     # -----------------------------------------------------
     # CHART A STATUS: stays on RAW NaN/boolean (do NOT use capped values here).
@@ -874,7 +884,7 @@ def generate_simulation_dashboards(raw_df):
         f"Light = optimistic (predicted failure later than it occurred — the risk side).  \n"
         f"Mid-tone = on target.  \n"
         f"The scale saturates at ±{action_window} days (your action window). "
-        f"Channels that never cross the threshold are scored against the {RUL_HORIZON}-day "
+        f"Channels that never cross the threshold are scored against the {display_horizon}-day "
         f"safe horizon, so the algorithm's behaviour remains visible rather than blank."
     )
 
@@ -902,7 +912,7 @@ def generate_simulation_dashboards(raw_df):
     # ==========================================
     # CHART C: Aggregated Scatter (full width)
     #   X (Actual RUL): UNCAPPED  -> true distance to crossing
-    #   Y (Predicted RUL): CAPPED @ RUL_HORIZON
+    #   Y (Predicted RUL): CAPPED @ display_horizon
     # ==========================================
     st.subheader("Chart C: Prediction Scatter")
     st.caption(
@@ -911,7 +921,7 @@ def generate_simulation_dashboards(raw_df):
         f"Above the line = optimistic (predicted more remaining life than actual).  \n"
         f"Below the line = conservative.  \n"
         f"The x-axis is uncapped (true distance to failure), while the y-axis is capped at "
-        f"{RUL_HORIZON} days, so points toward the right that flatten along the top edge are "
+        f"{display_horizon} days, so points toward the right that flatten along the top edge are "
         f"cases the model classified as effectively safe. The right-most lane marks channels "
         f"that never cross the threshold."
     )
@@ -919,13 +929,13 @@ def generate_simulation_dashboards(raw_df):
     df_scatter = df.copy()
     real_actual_max = df_scatter['Actual_RUL'].max(skipna=True)
     if pd.isna(real_actual_max):
-        real_actual_max = RUL_HORIZON
+        real_actual_max = display_horizon
     never_pos = real_actual_max * 1.15  # parking lane for "Never Breaches"
     df_scatter['Actual_RUL_plot'] = df_scatter['Actual_RUL'].fillna(never_pos)
 
     if not df_scatter.empty:
         x_view_max = max(never_pos, action_window * 2) * 1.10
-        y_view_max = RUL_HORIZON * 1.05
+        y_view_max = display_horizon * 1.05
 
         fig_c = px.scatter(
             df_scatter, x="Actual_RUL_plot", y="Nominal_RUL_c", color="Status",
@@ -942,11 +952,11 @@ def generate_simulation_dashboards(raw_df):
         fig_c.add_annotation(x=never_pos, y=y_view_max, yanchor="top", showarrow=False,
                              text="Never crosses →", font=dict(size=11, color="gray"),
                              xshift=-5, xanchor="right")
-        fig_c.add_hline(y=RUL_HORIZON, line_width=1, line_dash="dashdot", line_color="lightgray")
+        fig_c.add_hline(y=display_horizon, line_width=1, line_dash="dashdot", line_color="lightgray")
 
         fig_c.update_layout(
             xaxis_title="Actual RUL (Days, uncapped)",
-            yaxis_title=f"Predicted RUL (Days, capped @ {RUL_HORIZON})",
+            yaxis_title=f"Predicted RUL (Days, capped @ {display_horizon})",
             xaxis=dict(range=[0, x_view_max]), yaxis=dict(range=[0, y_view_max]),
             height=600, template="plotly_white",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
