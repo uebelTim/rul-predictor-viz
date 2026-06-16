@@ -745,6 +745,24 @@ def generate_simulation_dashboards(raw_df):
         "Action Window (Days)", min_value=5, max_value=90, value=30, step=1,
         help="[Updates Instantly] Defines your operational horizon. Used to calculate True/False Positives."
     )
+    st.markdown("### Operational Thresholds")
+    col_aw, col_hz = st.columns(2)
+    with col_aw:
+        action_window = st.slider(
+            "Action Window (Days)", min_value=5, max_value=90, value=30, step=1,
+            help="[Updates Instantly] Operational horizon for True/False Positives."
+        )
+    with col_hz:
+        display_horizon = st.slider(
+            "Safe Horizon (Days)", min_value=30, max_value=730, value=RUL_HORIZON, step=5,
+            help="[Updates Instantly] Predictions beyond this are treated as 'Safe'. "
+                 "Post-processing only — no simulation re-run needed."
+        )
+
+    # Drive ALL capping from the live slider instead of the global constant:
+    df['Nominal_RUL_c'] = df['Nominal_RUL'].apply(lambda x: to_horizon(x, display_horizon))
+    df['Actual_RUL_c']  = df['Actual_RUL'].apply(lambda x: to_horizon(x, display_horizon))
+
 
     # -----------------------------------------------------
     # HORIZON-CAPPED COLUMNS (for Bias / Scatter / distributions)
@@ -825,7 +843,7 @@ def generate_simulation_dashboards(raw_df):
     st.subheader("Chart B: Directional Bias Matrix (Continuous)")
     st.markdown(
         f"*(Dark = predicted >{action_window} days **early** | Mid = on-target | Light = predicted >{action_window} days **late**. "
-        f"Cells where the threshold is never crossed use the {RUL_HORIZON}-day horizon, so algorithm behaviour is still visualized.)*"
+        f"Cells where the threshold is never crossed use the {display_horizon}-day horizon, so algorithm behaviour is still visualized.)*"
     )
 
     rocket_palette = sns.color_palette("viridis", n_colors=256).as_hex()
@@ -853,7 +871,7 @@ def generate_simulation_dashboards(raw_df):
         # ==========================================
     # CHART C: Aggregated Scatter
     #   X (Actual RUL): UNCAPPED  -> shows true distance to crossing
-    #   Y (Predicted RUL): CAPPED @ RUL_HORIZON
+    #   Y (Predicted RUL): CAPPED @ display_horizon
     # ==========================================
     col1, col2 = st.columns(2)
     df_scatter = df.copy()
@@ -862,7 +880,7 @@ def generate_simulation_dashboards(raw_df):
     # largest real actual so it's visible and clearly separated, not piled at 365.
     real_actual_max = df_scatter['Actual_RUL'].max(skipna=True)
     if pd.isna(real_actual_max):
-        real_actual_max = RUL_HORIZON  # no real crossings at all -> fall back
+        real_actual_max = display_horizon  # no real crossings at all -> fall back
     never_pos = real_actual_max * 1.15  # parking lane for "Never Breaches"
 
     df_scatter['Actual_RUL_plot'] = df_scatter['Actual_RUL'].fillna(never_pos)
@@ -874,7 +892,7 @@ def generate_simulation_dashboards(raw_df):
         if not df_scatter.empty:
             # Bigger, decoupled window: X follows the real data, Y bounded to horizon.
             x_view_max = max(never_pos, action_window * 2) * 1.10
-            y_view_max = RUL_HORIZON * 1.05
+            y_view_max = display_horizon * 1.05
 
             fig_c = px.scatter(
                 df_scatter, x="Actual_RUL_plot", y="Nominal_RUL_c", color="Status",
@@ -901,11 +919,11 @@ def generate_simulation_dashboards(raw_df):
             )
 
             # Horizon cap guide on the predicted axis.
-            fig_c.add_hline(y=RUL_HORIZON, line_width=1, line_dash="dashdot", line_color="lightgray")
+            fig_c.add_hline(y=display_horizon, line_width=1, line_dash="dashdot", line_color="lightgray")
 
             fig_c.update_layout(
                 xaxis_title="Actual RUL (Days, uncapped)",
-                yaxis_title=f"Predicted RUL (Days, capped @ {RUL_HORIZON})",
+                yaxis_title=f"Predicted RUL (Days, capped @ {display_horizon})",
                 xaxis=dict(range=[0, x_view_max]),
                 yaxis=dict(range=[0, y_view_max]),
                 height=800,  # taller window
