@@ -1005,7 +1005,7 @@ def generate_simulation_dashboards(raw_df):
                 scaleratio=1      # 1:1 aspect ratio
             ),
             
-            width=800,
+            width=1200,
             height=800,
             
             # 3. Add explicit symmetric margins to prevent uneven squeezing
