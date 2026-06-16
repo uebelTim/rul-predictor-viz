@@ -909,63 +909,98 @@ def generate_simulation_dashboards(raw_df):
     )
     st.plotly_chart(fig_b, use_container_width=True)
 
+
     # ==========================================
     # CHART C: Aggregated Scatter (full width)
-    #   X (Actual RUL): UNCAPPED  -> true distance to crossing
-    #   Y (Predicted RUL): CAPPED @ display_horizon
     # ==========================================
     st.subheader("Chart C: Prediction Scatter")
-    st.caption(
-        f"Each point is one evaluation: actual time-to-crossing (x) against the model's "
-        f"predicted RUL (y). Points on the dashed diagonal are exact.  \n"
-        f"Above the line = optimistic (predicted more remaining life than actual).  \n"
-        f"Below the line = conservative.  \n"
-        f"The x-axis is uncapped (true distance to failure), while the y-axis is capped at "
-        f"{display_horizon} days, so points toward the right that flatten along the top edge are "
-        f"cases the model classified as effectively safe. The right-most lane marks channels "
-        f"that never cross the threshold."
+    
+    # 1. Add a toggle to filter the view
+    scatter_mode = st.radio(
+        "Chart C View Mode:",
+        ["Finite predictions only (Recommended)", "All evaluations (Includes Safe/Never reaches)"],
+        horizontal=True
     )
 
     df_scatter = df.copy()
+
+    if scatter_mode == "Finite predictions only (Recommended)":
+        # Keep only rows where the algorithm predicted an actual numeric crossing
+        df_scatter = df_scatter[df_scatter['Nominal_RUL'].notna()].copy()
+        st.caption(
+            "Showing only evaluations where the model predicted a finite crossing time. "
+            "Points on the dashed diagonal are exact. Above the line = optimistic; below = conservative."
+        )
+    else:
+        st.caption(
+            f"Showing all evaluations. The x-axis places real crossings normally, but groups "
+            f"'never crosses' cases into a right-most parking lane. The y-axis caps safe predictions "
+            f"at {display_horizon} days (flattening along the top edge)."
+        )
+
+    # 2. Prepare clean names for the hover tooltip
+    df_scatter['Predicted RUL'] = df_scatter['Hover_Pred']
+    df_scatter['Actual Outcome'] = df_scatter['Hover_Act']
+
+    # 3. Create the parking lane for "never breaches"
     real_actual_max = df_scatter['Actual_RUL'].max(skipna=True)
     if pd.isna(real_actual_max):
         real_actual_max = display_horizon
-    never_pos = real_actual_max * 1.15  # parking lane for "Never Breaches"
+    never_pos = real_actual_max * 1.15
     df_scatter['Actual_RUL_plot'] = df_scatter['Actual_RUL'].fillna(never_pos)
 
     if not df_scatter.empty:
         x_view_max = max(never_pos, action_window * 2) * 1.10
         y_view_max = display_horizon * 1.05
 
+        # 4. Build the scatter, hiding internal variables in the hover_data config
         fig_c = px.scatter(
             df_scatter, x="Actual_RUL_plot", y="Nominal_RUL_c", color="Status",
-            hover_data=["Channel", "Evaluation_Day", "Hover_Pred", "Hover_Act"],
+            hover_data={
+                "Actual_RUL_plot": False,  # Hide internal plot value
+                "Nominal_RUL_c": False,    # Hide internal capped value
+                "Status": False,           # Handled by the color label
+                "Channel": True,
+                "Evaluation_Day": True,
+                "Predicted RUL": True,
+                "Actual Outcome": True
+            },
             color_discrete_map=color_map_status
         )
 
         diag_max = min(x_view_max, y_view_max)
         fig_c.add_trace(go.Scatter(x=[0, diag_max], y=[0, diag_max], mode='lines',
                                    name='Perfect Prediction', line=dict(color='black', dash='dash')))
+        
         fig_c.add_vline(x=action_window, line_width=1, line_dash="dot", line_color="gray")
         fig_c.add_hline(y=action_window, line_width=1, line_dash="dot", line_color="gray")
-        fig_c.add_vline(x=never_pos, line_width=1, line_dash="dashdot", line_color="lightgray")
-        fig_c.add_annotation(x=never_pos, y=y_view_max, yanchor="top", showarrow=False,
-                             text="Never crosses →", font=dict(size=11, color="gray"),
-                             xshift=-5, xanchor="right")
+        
+        # Only draw the "Never crosses" parking lane if there are actually NaN values being plotted
+        if df_scatter['Actual_RUL'].isna().any():
+            fig_c.add_vline(x=never_pos, line_width=1, line_dash="dashdot", line_color="lightgray")
+            fig_c.add_annotation(x=never_pos, y=y_view_max, yanchor="top", showarrow=False,
+                                 text="Never crosses →", font=dict(size=11, color="gray"),
+                                 xshift=-5, xanchor="right")
+            
         fig_c.add_hline(y=display_horizon, line_width=1, line_dash="dashdot", line_color="lightgray")
 
+        # Dynamic X-axis title based on the mode
+        if scatter_mode == "Finite predictions only (Recommended)" and not df_scatter['Actual_RUL'].isna().any():
+            x_title = "Actual outcome (Days)"
+        else:
+            x_title = "Actual outcome (Days; safe cases grouped at right)"
+
         fig_c.update_layout(
-            xaxis_title="Actual RUL (Days, uncapped)",
+            xaxis_title=x_title,
             yaxis_title=f"Predicted RUL (Days, capped @ {display_horizon})",
             xaxis=dict(range=[0, x_view_max]), yaxis=dict(range=[0, y_view_max]),
-            height=800,
-            width =800,
-            template="plotly_white",
+            height=600, template="plotly_white",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
         st.plotly_chart(fig_c, use_container_width=True)
     else:
-        st.info("No simulation data available to scatter.")
+        st.info("No simulation data available for this view.")
+
 
 
 
