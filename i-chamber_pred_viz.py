@@ -758,14 +758,12 @@ def to_horizon(rul, horizon=RUL_HORIZON):
     return float(min(rul, horizon))
 
 
-# ---------------------------------------------------------
-# Simulation Dashboard Generator
-# ---------------------------------------------------------
 def generate_simulation_dashboards(raw_df):
     """
-    Chart A: Status Heatmap (driven by RAW NaN/boolean - unchanged classification).
-    Chart B: Bias Heatmap (driven by HORIZON-CAPPED columns -> now defined everywhere).
-    Chart C: Scatter.
+    Chart A: Status Heatmap (classification driven by RAW NaN/boolean).
+             Hover shows "Never reaches threshold (Safe)" for NaN predictions.
+    Chart B: Bias Heatmap (driven by HORIZON-CAPPED columns -> defined everywhere).
+    Chart C: Scatter (full width; actual UNCAPPED, predicted CAPPED @ horizon).
     """
     df = raw_df.copy()
 
@@ -776,34 +774,20 @@ def generate_simulation_dashboards(raw_df):
     st.header("📊 Fleet Backtesting Results")
 
     st.markdown("### Operational Thresholds")
-    col_aw, col_hz = st.columns(2)
-    with col_aw:
-        action_window = st.slider(
-            "Action Window (Days)", min_value=5, max_value=90, value=30, step=1,
-            help="[Updates Instantly] Operational horizon for True/False Positives."
-        )
-    with col_hz:
-        display_horizon = st.slider(
-            "Safe Horizon (Days)", min_value=30, max_value=730, value=RUL_HORIZON, step=5,
-            help="[Updates Instantly] Predictions beyond this are treated as 'Safe'. "
-                 "Post-processing only — no simulation re-run needed."
-        )
-
-    # Drive ALL capping from the live slider instead of the global constant:
-    df['Nominal_RUL_c'] = df['Nominal_RUL'].apply(lambda x: to_horizon(x, display_horizon))
-    df['Actual_RUL_c']  = df['Actual_RUL'].apply(lambda x: to_horizon(x, display_horizon))
-
+    action_window = st.slider(
+        "Action Window (Days)", min_value=5, max_value=90, value=30, step=1,
+        help="[Updates Instantly] Defines your operational horizon. Used to calculate True/False Positives."
+    )
 
     # -----------------------------------------------------
-    # HORIZON-CAPPED COLUMNS (for Bias / Scatter / distributions)
-    # NaN actual = "never crosses" -> treated as full horizon so bias is still measurable.
+    # HORIZON-CAPPED COLUMNS (continuous charts B & C only).
+    # NaN actual/predicted ("never reached") -> full horizon so a position exists.
     # -----------------------------------------------------
     df['Nominal_RUL_c'] = df['Nominal_RUL'].apply(to_horizon)
     df['Actual_RUL_c'] = df['Actual_RUL'].apply(to_horizon)
 
     # -----------------------------------------------------
-    # CHART A STATUS: stays on RAW NaN/boolean (do NOT use capped values here,
-    # otherwise a true "never breaches" could flip classification).
+    # CHART A STATUS: stays on RAW NaN/boolean (do NOT use capped values here).
     # -----------------------------------------------------
     actual_safe = df['Actual_RUL'].isna() | (df['Actual_RUL'] > action_window)
     pred_safe = df['Nominal_RUL'].isna() | (df['Nominal_RUL'] > action_window)
@@ -815,18 +799,20 @@ def generate_simulation_dashboards(raw_df):
     df.loc[~actual_safe & pred_safe, 'Status'] = 'False Negative'
 
     # -----------------------------------------------------
-    # BIAS SCORE: now computed from CAPPED columns -> no NaN holes in Chart B.
-    # Positive error = predicted later than actual (late/optimistic) -> toward 1.
-    # Negative error = predicted earlier (early/conservative) -> toward 0.
+    # BIAS SCORE: computed from CAPPED columns -> no NaN holes in Chart B.
     # -----------------------------------------------------
     error = df['Nominal_RUL_c'] - df['Actual_RUL_c']
     df['Bias_Score'] = np.clip((error + action_window) / (action_window * 2), 0.0, 1.0)
 
     df['Eval_Day_Rounded'] = df['Evaluation_Day'].round().astype(int)
 
-    # Hover keeps the RAW semantics so users can still distinguish a literal 365
-    # prediction from a true "never breaches".
-    df['Hover_Pred'] = df['Nominal_RUL'].apply(lambda x: f"{x:.1f} Days" if pd.notna(x) else "Safe/Unknown")
+    # Hover keeps RAW semantics: NaN prediction is explicitly "never reached", not a number.
+    def _fmt_pred(x):
+        if pd.isna(x):
+            return "Never reaches threshold (Safe)"
+        return f"{x:.1f} Days"
+
+    df['Hover_Pred'] = df['Nominal_RUL'].apply(_fmt_pred)
     df['Hover_Act'] = df['Actual_RUL'].apply(lambda x: f"{x:.1f} Days" if pd.notna(x) else "Never Breaches")
 
     pivot_pred = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Pred', aggfunc='first')
@@ -840,23 +826,23 @@ def generate_simulation_dashboards(raw_df):
     # ==========================================
     st.subheader("Chart A: Lifecycle Confusion Matrix (Categorical)")
     st.caption(
-    f"Each cell shows the model's classification for that day, evaluated against your "
-    f"{action_window}-day action window. "
-    f"🟩 True Positive: a failure inside the window was correctly predicted. "
-    f"🟧 False Positive: an alarm was raised, but no crossing occurred within the window. "
-    f"⬜ True Negative: no alarm was raised and none was needed. "
-    f"🟥 False Negative: an actual crossing was not predicted (the highest-risk case). "
-    f"Use the time axis to identify whether a channel is over-alarming early in its life "
-    f"and stabilising later."
-)
-
+        f"Each cell shows the model's classification for that day, evaluated against your "
+        f"{action_window}-day action window:  \n"
+        f"🟩 True Positive: a failure inside the window was correctly predicted.  \n"
+        f"🟧 False Positive: an alarm was raised, but no crossing occurred within the window.  \n"
+        f"⬜ True Negative: no alarm was raised and none was needed.  \n"
+        f"🟥 False Negative: an actual crossing was not predicted (the highest-risk case).  \n"
+        f"Use the time axis to identify whether a channel is over-alarming early in its life "
+        f"and stabilising later."
+    )
 
     status_map = {"True Negative": 0, "False Positive": 1, "True Positive": 2, "False Negative": 3}
     df['Status_Code'] = df['Status'].map(status_map)
 
     pivot_status_code = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status_Code', aggfunc='first')
     pivot_status_text = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status', aggfunc='first')
-    customdata_a = np.dstack((pivot_status_text.values, pivot_pred.reindex_like(pivot_status_text).values,
+    customdata_a = np.dstack((pivot_status_text.values,
+                              pivot_pred.reindex_like(pivot_status_text).values,
                               pivot_act.reindex_like(pivot_status_text).values))
 
     colorscale_a = [[0.0, '#E8F5E9'], [0.33, '#FFB74D'], [0.66, '#4CAF50'], [1.0, '#F44336']]
@@ -868,7 +854,7 @@ def generate_simulation_dashboards(raw_df):
         hovertemplate="<b>Day:</b> %{x}<br><b>Channel:</b> %{y}<br><b>Result:</b> %{customdata[0]}<br><b>Predicted:</b> %{customdata[1]}<br><b>Actual:</b> %{customdata[2]}<extra></extra>"
     ))
     for name, color in [("True Negative (Safe)", '#E8F5E9'), ("False Positive (Early Alarm)", '#FFB74D'),
-                        ("True Positive (Good Catch)", '#4CAF50'), ("False Negative (Missed Crossing)", '#F44336')]:
+                        ("True Positive (Correct Detection)", '#4CAF50'), ("False Negative (Missed Crossing)", '#F44336')]:
         fig_a.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
                                    marker=dict(size=15, color=color, symbol='square', line=dict(color='black', width=1)), name=name))
     fig_a.update_layout(
@@ -879,23 +865,22 @@ def generate_simulation_dashboards(raw_df):
     st.plotly_chart(fig_a, use_container_width=True)
 
     # ==========================================
-    # CHART B: Directional Bias Heatmap (now filled everywhere)
+    # CHART B: Directional Bias Heatmap
     # ==========================================
     st.subheader("Chart B: Directional Bias Matrix (Continuous)")
     st.caption(
-    f"Shows the direction of each prediction's error, not only whether it was correct. "
-    f"Dark = conservative (predicted failure earlier than it occurred — the safe side). "
-    f"Light = optimistic (predicted failure later than it occurred — the risk side). "
-    f"Mid-tone = on target. The scale saturates at ±{action_window} days (the set action window). "
-    f"Channels that never cross the threshold are scored against the {RUL_HORIZON}-day "
-    f"safe horizon, so the algorithm's behaviour remains visible rather than blank."
+        f"Shows the direction of each prediction's error, not only whether it was correct:  \n"
+        f"Dark = conservative (predicted failure earlier than it occurred — the safe side).  \n"
+        f"Light = optimistic (predicted failure later than it occurred — the risk side).  \n"
+        f"Mid-tone = on target.  \n"
+        f"The scale saturates at ±{action_window} days (your action window). "
+        f"Channels that never cross the threshold are scored against the {RUL_HORIZON}-day "
+        f"safe horizon, so the algorithm's behaviour remains visible rather than blank."
     )
 
-
-    rocket_palette = sns.color_palette("viridis", n_colors=256).as_hex()
+    rocket_palette = sns.color_palette("rocket", n_colors=256).as_hex()
     pivot_bias = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Bias_Score', aggfunc='first')
 
-    # Richer hover: bias + whether the actual ever crossed.
     df['Hover_Bias'] = df['Bias_Score'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
     pivot_bias_text = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Bias', aggfunc='first')
     customdata_b = np.dstack((pivot_bias_text.reindex_like(pivot_bias).values,
@@ -914,46 +899,28 @@ def generate_simulation_dashboards(raw_df):
     )
     st.plotly_chart(fig_b, use_container_width=True)
 
-        # ==========================================
-    # CHART C: Aggregated Scatter
-    #   X (Actual RUL): UNCAPPED  -> shows true distance to crossing
-    #   Y (Predicted RUL): CAPPED @ display_horizon
     # ==========================================
-    col1, col2 = st.columns(2)
-    df_scatter = df.copy()
-
-    # X axis: uncapped actual. "Never crosses" (NaN) is placed just beyond the
-    # largest real actual so it's visible and clearly separated, not piled at 365.
-    real_actual_max = df_scatter['Actual_RUL'].max(skipna=True)
-    if pd.isna(real_actual_max):
-        real_actual_max = display_horizon  # no real crossings at all -> fall back
-    never_pos = real_actual_max * 1.15  # parking lane for "Never Breaches"
-
-    df_scatter['Actual_RUL_plot'] = df_scatter['Actual_RUL'].fillna(never_pos)
-    # Y axis: predicted stays capped at the horizon.
-    # (Nominal_RUL_c was already computed above via to_horizon.)
-
-        # ==========================================
-    # CHART C: Aggregated Scatter (full width, consistent with A & B)
+    # CHART C: Aggregated Scatter (full width)
     #   X (Actual RUL): UNCAPPED  -> true distance to crossing
-    #   Y (Predicted RUL): CAPPED @ display_horizon
+    #   Y (Predicted RUL): CAPPED @ RUL_HORIZON
     # ==========================================
     st.subheader("Chart C: Prediction Scatter")
     st.caption(
         f"Each point is one evaluation: actual time-to-crossing (x) against the model's "
-        f"predicted RUL (y). Points on the dashed diagonal are exact. "
-        f"Above the line = optimistic (predicted more remaining life than actual); "
-        f"below the line = conservative. The x-axis is uncapped (true distance to failure), "
-        f"while the y-axis is capped at {RUL_HORIZON} days, so points toward the right that "
-        f"flatten along the top edge are cases the model classified as effectively safe. "
-        f"The right-most lane marks channels that never cross the threshold."
+        f"predicted RUL (y). Points on the dashed diagonal are exact.  \n"
+        f"Above the line = optimistic (predicted more remaining life than actual).  \n"
+        f"Below the line = conservative.  \n"
+        f"The x-axis is uncapped (true distance to failure), while the y-axis is capped at "
+        f"{RUL_HORIZON} days, so points toward the right that flatten along the top edge are "
+        f"cases the model classified as effectively safe. The right-most lane marks channels "
+        f"that never cross the threshold."
     )
 
     df_scatter = df.copy()
     real_actual_max = df_scatter['Actual_RUL'].max(skipna=True)
     if pd.isna(real_actual_max):
         real_actual_max = RUL_HORIZON
-    never_pos = real_actual_max * 1.15
+    never_pos = real_actual_max * 1.15  # parking lane for "Never Breaches"
     df_scatter['Actual_RUL_plot'] = df_scatter['Actual_RUL'].fillna(never_pos)
 
     if not df_scatter.empty:
@@ -965,6 +932,7 @@ def generate_simulation_dashboards(raw_df):
             hover_data=["Channel", "Evaluation_Day", "Hover_Pred", "Hover_Act"],
             color_discrete_map=color_map_status
         )
+
         diag_max = min(x_view_max, y_view_max)
         fig_c.add_trace(go.Scatter(x=[0, diag_max], y=[0, diag_max], mode='lines',
                                    name='Perfect Prediction', line=dict(color='black', dash='dash')))
@@ -989,9 +957,6 @@ def generate_simulation_dashboards(raw_df):
 
 
 
-# ---------------------------------------------------------
-# The Second Page (Live Simulation)
-# ---------------------------------------------------------
 def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_window,
                          use_dynamic_variance, break_window, break_step, break_sustained,
                          override_model, manual_model):
@@ -1049,11 +1014,9 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
             crossing_indices = np.where(smooth_np >= target_thresh)[0]
             actual_crossing_day = time_arr_np[crossing_indices[0]] if len(crossing_indices) > 0 else np.nan
 
+            # Detection point (marker) + look-back evaluation start.
             break_idx, _break_time, eval_start_idx = detect_structural_break(
-                time_arr, sensor_smooth, window=break_window, step=break_step,
-                sustained_wins=break_sustained
-                # eval_lookback defaults to (sustained_wins-1)*break_step;
-                # pass eval_lookback=<days> to override.
+                time_arr, sensor_smooth, window=break_window, step=break_step, sustained_wins=break_sustained
             )
 
             start_idx = 50
@@ -1083,6 +1046,22 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
             # OPT-E: warm-start cache (winner params reused as next-step seed).
             warm_start_cache = None
 
+            # EMA rule:
+            #  - real value  -> update EMA normally, store smoothed value
+            #  - NaN AND EMA already running (prev not None) -> bridge EMA with RUL_HORIZON (365)
+            #    to keep the running value moving, but STORE NaN ("never reached")
+            #  - NaN AND EMA not started yet (prev is None) -> skip, store NaN
+            def _ema_update(prev, new_raw):
+                if np.isnan(new_raw):
+                    if prev is None:
+                        return prev, np.nan          # leading NaN: skip, store NaN
+                    bridged = alpha * float(RUL_HORIZON) + (1 - alpha) * prev
+                    return bridged, np.nan           # bridge EMA with 365, store NaN
+                if prev is None:
+                    return float(new_raw), float(new_raw)  # seed
+                smoothed = alpha * float(new_raw) + (1 - alpha) * prev
+                return smoothed, smoothed
+
             for step_idx, current_cutoff in enumerate(timesteps):
                 hist_time = time_arr_np[:current_cutoff]
                 hist_smooth = smooth_np[:current_cutoff]
@@ -1101,7 +1080,6 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                 if override_model:
                     # Override is the rare case: fit ONLY the forced model (no competition).
                     best_model = manual_model
-                    winner_params = None
                     mse_log_str = f"{manual_model}: (override - competition skipped)"
                     raw_n, raw_u, raw_l = calculate_rul_headless(
                         hist_time, hist_smooth, hist_raw, best_model, target_thresh,
@@ -1139,15 +1117,10 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                         use_dynamic_variance=use_dynamic_variance, precomputed_params=winner_params
                     )
 
-                # Treat NaN (Safe/Infinite RUL) as horizon for stable EMA math.
-                n_val = float(RUL_HORIZON) if np.isnan(raw_n) else float(raw_n)
-                u_val = float(RUL_HORIZON) if np.isnan(raw_u) else float(raw_u)
-                l_val = float(RUL_HORIZON) if np.isnan(raw_l) else float(raw_l)
-
-                # OPT-D: O(1) EMA update.
-                ema_n = n_val if ema_n is None else alpha * n_val + (1 - alpha) * ema_n
-                ema_u = u_val if ema_u is None else alpha * u_val + (1 - alpha) * ema_u
-                ema_l = l_val if ema_l is None else alpha * l_val + (1 - alpha) * ema_l
+                # NaN-preserving EMA (bridges with 365 only after the EMA has started).
+                ema_n, store_n = _ema_update(ema_n, raw_n)
+                ema_u, store_u = _ema_update(ema_u, raw_u)
+                ema_l, store_l = _ema_update(ema_l, raw_l)
 
                 actual_rul = actual_crossing_day - current_day if not np.isnan(actual_crossing_day) else np.nan
                 if not np.isnan(actual_rul) and actual_rul < 0:
@@ -1158,9 +1131,9 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                     'Evaluation_Day': current_day,
                     'Model_Used': f"{best_model} (Override)" if override_model else best_model,
                     'Actual_RUL': actual_rul,
-                    'Nominal_RUL': ema_n,
-                    'Upper_Risk_RUL': ema_u,
-                    'Lower_Risk_RUL': ema_l,
+                    'Nominal_RUL': store_n,     # NaN when model said "never reached"
+                    'Upper_Risk_RUL': store_u,
+                    'Lower_Risk_RUL': store_l,
                     'All_Models_MSE': mse_log_str
                 })
 
@@ -1179,6 +1152,7 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
         generate_simulation_dashboards(st.session_state['sim_results'])
         with st.expander("View Raw Simulation Logs"):
             st.dataframe(st.session_state['sim_results'], use_container_width=True)
+
 
 
 # ---------------------------------------------------------
