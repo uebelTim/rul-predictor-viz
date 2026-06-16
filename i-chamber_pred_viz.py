@@ -886,7 +886,7 @@ def generate_simulation_dashboards(raw_df):
     f"Shows the direction of each prediction's error, not only whether it was correct. "
     f"Dark = conservative (predicted failure earlier than it occurred — the safe side). "
     f"Light = optimistic (predicted failure later than it occurred — the risk side). "
-    f"Mid-tone = on target. The scale saturates at ±{action_window} days (your action window). "
+    f"Mid-tone = on target. The scale saturates at ±{action_window} days (the set action window). "
     f"Channels that never cross the threshold are scored against the {RUL_HORIZON}-day "
     f"safe horizon, so the algorithm's behaviour remains visible rather than blank."
     )
