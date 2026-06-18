@@ -1342,9 +1342,31 @@ def main():
         st.info("👋 Welcome! Please upload your sensor data CSV in the sidebar to begin.")
         st.stop()
 
+    # =========================================================
+    # MOVED UP: DEEP-DIVE SETTINGS (Visual placement only)
+    # =========================================================
+    selected_col = None
+    if app_mode == "Deep-Dive Analysis":
+        st.sidebar.markdown("---")
+        st.sidebar.header("🔍 Deep-Dive Settings")
+        
+        raw_channels = get_available_channels(uploaded_file)
+        display_options = []
+        for c in raw_channels:
+            if c in ['32', '73']:
+                display_options.append(f"{c} (Outlier/Deviating)")
+            else:
+                display_options.append(c)
+
+        selected_display = st.sidebar.selectbox("1. Select Data Channel", options=display_options)
+        selected_col = selected_display.split(" ")[0]
+
+    # =========================================================
+    # SHARED PARAMETERS
+    # =========================================================
     st.sidebar.markdown("---")
     st.sidebar.header("🛠️ Shared Parameters")
-    
+
     st.sidebar.markdown("### Predictive Model Context")
     window_size = st.sidebar.number_input(
         "Window Size (Lookback Days)", min_value=10, max_value=5000, value=300, step=10,
@@ -1356,18 +1378,14 @@ def main():
     )
 
     st.sidebar.markdown("### Outlier Filtering")
-    outlier_factor = st.sidebar.slider("IQR Outlier Factor", min_value=0.5, max_value=10.0, value=3.0, step=0.1,
-                                       help="[Requires Simulation Re-run] How aggressively to flatten spikes.")
-    outlier_window = st.sidebar.number_input("Rolling Window (4h Periods)", min_value=5, max_value=200, value=42, step=1,
-                                             help="[Requires Simulation Re-run] 42 periods = 7 days of local context.")
+    outlier_factor = st.sidebar.slider("IQR Outlier Factor", min_value=0.5, max_value=10.0, value=3.0, step=0.1)
+    outlier_window = st.sidebar.number_input("Rolling Window (4h Periods)", min_value=5, max_value=200, value=42, step=1)
 
     st.sidebar.markdown("### Variance Configuration")
-    use_dynamic_variance = st.sidebar.toggle("Use Dynamic Variance (Linear Fit)", value=True,
-                                             help="[Requires Simulation Re-run] ON: bands widen over time. OFF: parallel bands.")
+    use_dynamic_variance = st.sidebar.toggle("Use Dynamic Variance (Linear Fit)", value=True)
 
     st.sidebar.markdown("### Model Override")
-    override_model = st.sidebar.toggle("Enable Manual Selection", value=False,
-                                       help="[Requires Simulation Re-run] Forces a specific model, ignoring the auto recommendation.")
+    override_model = st.sidebar.toggle("Enable Manual Selection", value=False)
     manual_model = st.sidebar.selectbox("Force specific model:", options=AVAILABLE_MODELS, disabled=not override_model)
 
     st.sidebar.markdown("### Structural Break Algorithm")
@@ -1384,27 +1402,21 @@ def main():
             break_step = st.number_input("Step Size (Days)", min_value=1, max_value=30, value=7, step=1)
         with col_t:
             break_sustained = st.number_input("Sustained Wins", min_value=1, max_value=10, value=2, step=1)
-            
-        z_factor = None # Not used
-        z_sustained = None # Not used
+        z_factor = None
+        z_sustained = None
     else:
-        z_factor = st.sidebar.number_input("Z-Score Multiplier", min_value=1.0, max_value=10.0, value=3.0, step=0.5,
-                                           help="How many standard deviations above the fleet mean defines a break.")
-        z_sustained = st.sidebar.number_input("Sustained Points (Days)", min_value=1, max_value=20, value=3, step=1,
-                                              help="Consecutive days the value must stay above the Z-score limit.")
-        
+        z_factor = st.sidebar.number_input("Z-Score Multiplier", min_value=1.0, max_value=10.0, value=3.0, step=0.5)
+        z_sustained = st.sidebar.number_input("Sustained Points (Days)", min_value=1, max_value=20, value=3, step=1)
         break_window = None
         break_step = None
         break_sustained = None
 
-    st.sidebar.markdown("### Model Priority Ranking")
-    with st.sidebar.expander("Configure Model Ranking", expanded=False):
+    st.sidebar.markdown("### Router Priority Ranking")
+    with st.sidebar.expander("Configure Router Ranking", expanded=False):
         st.caption("Drag and drop to set tie-breaker priority (Top = Highest Priority).")
-        
-        # Capture the output of the sortable list
         raw_sorted = sort_items(AVAILABLE_MODELS, direction='vertical')
         
-        # Fallback: if it returns None or empty during initial render, use the default list
+        # Fallback for Streamlit iframe render bug
         if not raw_sorted:
             sorted_models = AVAILABLE_MODELS
         else:
@@ -1412,32 +1424,18 @@ def main():
             
         user_priority_dict = {model: rank for rank, model in enumerate(sorted_models, start=1)}
 
-    # ROBUSTNESS: single horizon constant shared by both pages (no floating magic number).
     max_rul = RUL_HORIZON
 
     # =========================================================
     # PAGE 1: DEEP-DIVE ANALYSIS
     # =========================================================
     if app_mode == "Deep-Dive Analysis":
-        st.sidebar.markdown("---")
-        st.sidebar.header("🔍 Deep-Dive Settings")
-
-        raw_channels = get_available_channels(uploaded_file)
-        display_options = []
-        for c in raw_channels:
-            if c in ['32', '73']:
-                display_options.append(f"{c} (Outlier/Deviating)")
-            else:
-                display_options.append(c)
-
-        selected_display = st.sidebar.selectbox("1. Select Data Channel", options=display_options)
-        selected_col = selected_display.split(" ")[0]
-
+        # Data loading now happens here, safely AFTER all sidebar parameters are set
         sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(
             uploaded_file, col=selected_col, outlier_factor=outlier_factor, outlier_window=outlier_window
         )
 
-        # --- NEW ROUTER LOGIC ---
+        # --- Dynamic Structural Break Router ---
         if break_algo == "Fleet Z-Score":
             fleet_mean, fleet_std = compute_fleet_baseline(uploaded_file, outlier_factor, outlier_window)
             break_idx, break_time, _eval_start_idx = detect_zscore_break(
@@ -1447,7 +1445,6 @@ def main():
             break_idx, break_time, _eval_start_idx = detect_structural_break(
                 time_arr, sensor_arr_smooth, window=break_window, step=break_step, sustained_wins=break_sustained
             )
-
 
         max_index = len(time_arr) - 1
         thresholds = [0.2, 0.5, 1.0]
@@ -1472,12 +1469,11 @@ def main():
 
             if override_model:
                 best_model_name = manual_model
-                reuse_params = None  # forced model wasn't necessarily fit in competition
+                reuse_params = None  
             else:
                 best_model_name = list(top_models.keys())[0]
-                reuse_params = top_models[best_model_name].get('params')  # OPT-A reuse
+                reuse_params = top_models[best_model_name].get('params')
 
-            # OPT-A: pass winner params so fit_and_plotly_model doesn't re-fit.
             fig, fitted_series, rul_df = fit_and_plotly_model(
                 time_raw=sliced_time, sensor_smooth=sliced_sensor, sensor_raw=sliced_sensor_raw,
                 model_choice=best_model_name, thresholds=thresholds, input_time_unit="Days",
@@ -1493,14 +1489,12 @@ def main():
             with side_metrics_col:
                 st.markdown("### 📊 Model Router")
                 
-                # Fetch the absolute best AIC to calculate the Delta
                 best_aic_val = min([m.get('aic', float('inf')) for m in all_models.values()])
                 
                 leaderboard_data = []
                 for rank, (name, metrics) in enumerate(all_models.items(), start=1):
                     is_winner = (name == best_model_name)
                     
-                    # Calculate Delta AIC for the display
                     model_aic = metrics.get('aic', float('inf'))
                     delta_aic = model_aic - best_aic_val if model_aic != float('inf') else float('inf')
                     
@@ -1516,7 +1510,6 @@ def main():
                 
                 st.dataframe(pd.DataFrame(leaderboard_data), use_container_width=True, hide_index=True)
                 
-                # Add the UI explanation for the Delta AIC logic
                 st.caption(
                     "**How the Algorithm Chooses:** \n"
                     "The engine uses the **Akaike Information Criterion (AIC)**. "
@@ -1526,7 +1519,6 @@ def main():
 
                 st.markdown("---")
                 st.markdown("### ⏳ RUL Projections")
-                
                 if not rul_df.empty:
                     display_rul_df = rul_df[['Threshold', 'Status', 'Nominal_RUL', 'Upper_Band_RUL', 'Lower_Band_RUL']].copy()
 
@@ -1558,9 +1550,8 @@ def main():
             uploaded_file, user_priority_dict, outlier_factor, outlier_window,
             use_dynamic_variance, break_algo, break_window, break_step, break_sustained, 
             z_factor, z_sustained, override_model, manual_model, 
-            window_size, eval_window  # <--- Added here
+            window_size, eval_window
         )
-
 
 if __name__ == "__main__":
     main()
