@@ -45,6 +45,18 @@ def add_step_change(arr, start_idx, offset):
         res[start_idx:] += offset
     return res
 
+def add_logarithmic_curve(arr, start_idx, target_offset):
+    """Adds a logarithmic curve that rapidly rises and then heavily flattens."""
+    res = arr.copy()
+    tail_len = len(res) - start_idx
+    if tail_len > 0:
+        # np.log1p(linspace(0, 20)) ensures a strong initial spike that flattens out
+        curve = np.log1p(np.linspace(0, 20, tail_len))
+        # Scale the curve so the final point hits the exact target offset
+        curve = (curve / np.max(curve)) * target_offset
+        res[start_idx:] += curve
+    return res
+
 def stretch_or_squeeze_time(arr, start_idx, factor):
     """
     Time-warps the degradation tail. 
@@ -1454,8 +1466,8 @@ def page_synthetic_studio(base_df):
         st.markdown("**Exponential Curve** | *Compounding damage (e.g., crack propagation, thermal runaway)*")
         w_exp = st.slider("Exponential Weight", 0, 5, 1, label_visibility="collapsed")
         
-        st.markdown("**Step Change** | *Sudden discrete event (e.g., snapped belt, blown seal, bumped sensor)*")
-        w_step = st.slider("Step Change Weight", 0, 5, 1, label_visibility="collapsed")
+        st.markdown("**Logarithmic Curve** | *Rapid initial damage that flattens out (e.g., component break-in, plastic deformation)*")
+        w_log = st.slider("Logarithmic Weight", 0, 5, 1, label_visibility="collapsed")
         
     with col2:
         st.subheader("2. Mutate Unhealthy Assets")
@@ -1520,8 +1532,9 @@ def page_synthetic_studio(base_df):
 
             # Pipeline 1: Healthy to Fault
             if num_healthy > 0:
-                fault_types = ["Linear", "Exponential", "Step"]
-                fault_weights = [w_lin, w_exp, w_step]
+                # --- PIPELINE UPDATE: Logarithmic ---
+                fault_types = ["Linear", "Exponential", "Logarithmic"]
+                fault_weights = [w_lin, w_exp, w_log]
                 
                 if sum(fault_weights) > 0:
                     for i in range(num_healthy):
@@ -1539,8 +1552,10 @@ def page_synthetic_studio(base_df):
                             arr = add_linear_ramp(arr, start_idx, max_offset=np.random.uniform(0.5, 1.5))
                         elif f_type == "Exponential":
                             arr = add_exponential_curve(arr, start_idx, severity_factor=np.random.uniform(0.5, 2.0))
-                        elif f_type == "Step":
-                            arr = add_step_change(arr, start_idx, offset=np.random.uniform(0.3, 0.8))
+                        elif f_type == "Logarithmic":
+                            # Target offset is a random factor between 0.5 and 10x the Healthy Threshold
+                            target = np.random.uniform(0.5, 10.0) * healthy_thresh
+                            arr = add_logarithmic_curve(arr, start_idx, target_offset=target)
                             
                         new_col_name = f"INJECT_{f_type}_{i+1} (Base: {ch})"
                         synth_df[new_col_name] = arr
