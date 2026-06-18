@@ -8,11 +8,88 @@ import plotly.express as px
 import seaborn as sns
 import streamlit as st
 from streamlit_sortables import sort_items
+from scipy.interpolate import interp1d
 
 # =========================================================
 # GLOBAL CONFIG
 # =========================================================
 RUL_HORIZON = 365  # days; "Safe" (never reached) and anything beyond this saturate here.
+
+# =========================================================
+# SYNTHETIC FAULT GENERATORS
+# =========================================================
+
+def add_linear_ramp(arr, start_idx, max_offset):
+    """Adds a gradual, linear degradation starting at start_idx."""
+    res = arr.copy()
+    tail_len = len(res) - start_idx
+    if tail_len > 0:
+        res[start_idx:] += np.linspace(0, max_offset, tail_len)
+    return res
+
+def add_exponential_curve(arr, start_idx, severity_factor):
+    """Adds a compounding exponential curve starting at start_idx."""
+    res = arr.copy()
+    tail_len = len(res) - start_idx
+    if tail_len > 0:
+        # e^x curve scaled so the final point hits severity_factor
+        curve = np.exp(np.linspace(0, 3, tail_len)) - 1 
+        curve = (curve / np.max(curve)) * severity_factor
+        res[start_idx:] += curve
+    return res
+
+def add_step_change(arr, start_idx, offset):
+    """Instantly offsets the data after start_idx (e.g., sudden mechanical shift)."""
+    res = arr.copy()
+    if start_idx < len(res):
+        res[start_idx:] += offset
+    return res
+
+def stretch_or_squeeze_time(arr, start_idx, factor):
+    """
+    Time-warps the degradation tail. 
+    factor < 1.0 = faster failure (squeezed). 
+    factor > 1.0 = slower failure (stretched).
+    """
+    if start_idx >= len(arr) - 5:
+        return arr.copy()
+        
+    head = arr[:start_idx]
+    tail = arr[start_idx:]
+    
+    orig_x = np.linspace(0, 1, len(tail))
+    new_len = int(len(tail) * factor)
+    
+    # Interpolate the tail to a new length
+    f = interp1d(orig_x, tail, kind='linear', fill_value="extrapolate")
+    new_x = np.linspace(0, 1, new_len)
+    warped_tail = f(new_x)
+    
+    # Reassemble. If faster, pad end with NaNs so dataframe length matches.
+    # If slower, clip the end.
+    if factor < 1.0:
+        pad_len = len(tail) - new_len
+        warped_tail = np.concatenate([warped_tail, np.full(pad_len, np.nan)])
+    else:
+        warped_tail = warped_tail[:len(tail)]
+        
+    return np.concatenate([head, warped_tail])
+
+def add_baseline_drift(arr, drift_max):
+    """Adds a linear drift across the ENTIRE lifespan of the asset."""
+    drift = np.linspace(0, drift_max, len(arr))
+    return arr + drift
+
+def inject_tail_noise(arr, start_idx, noise_multiplier=2.0):
+    """Increases the variance of the signal near failure."""
+    res = arr.copy()
+    tail_len = len(res) - start_idx
+    if tail_len > 0:
+        # Calculate natural standard deviation of the healthy portion
+        healthy_std = np.nanstd(arr[:start_idx]) if start_idx > 10 else np.nanstd(arr)
+        noise = np.random.normal(0, healthy_std * noise_multiplier, tail_len)
+        res[start_idx:] += noise
+    return res
 
 
 def rolling_iqr_filter(data, window=20, factor=1.5, center=True, keep_nans=True):
@@ -451,6 +528,23 @@ def detect_zscore_break(time_arr, sensor_arr, fleet_mean, fleet_std, z_factor=3.
     eval_start_idx = max(0, trigger_idx - eval_lookback)
     return trigger_idx, time_arr[trigger_idx], eval_start_idx
 
+
+def add_baseline_drift(arr, drift_max):
+    """Adds a linear drift across the ENTIRE lifespan of the asset."""
+    drift = np.linspace(0, drift_max, len(arr))
+    return arr + drift
+
+def inject_tail_noise(arr, start_idx, noise_multiplier=2.0):
+    """Increases the variance of the signal near failure."""
+    res = arr.copy()
+    tail_len = len(res) - start_idx
+    if tail_len > 0:
+        # Calculate natural standard deviation of the healthy portion
+        healthy_std = np.nanstd(arr[:start_idx]) if start_idx > 10 else np.nanstd(arr)
+        noise = np.random.normal(0, healthy_std * noise_multiplier, tail_len)
+        res[start_idx:] += noise
+    return res
+
 # ---------------------------------------------------------
 # 4. Dynamic/Static Variance & RUL Plotting
 # ---------------------------------------------------------
@@ -718,49 +812,47 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     return fig, fitted_series, rul_df
 
 
-# ---------------------------------------------------------
-# 5. Data Loading & Extraction Functions
-# ---------------------------------------------------------
+# =========================================================
+# DATA LOADING & EXTRACTION
+# =========================================================
+
 @st.cache_data
-def get_available_channels(file_obj):
+def parse_raw_csv(file_obj):
+    """Parses the CSV once into a raw DataFrame to be cached and shared."""
     file_obj.seek(0)
-    df = pd.read_csv(file_obj, nrows=1)
-    cols = [col for col in df.columns if 'Error' not in col and col != 'DateTime']
+    df = pd.read_csv(file_obj, parse_dates=['DateTime'])
+    df.set_index('DateTime', inplace=True)
+    df = df[~df.index.duplicated(keep='first')]
+    return df
+
+def get_available_channels(df):
+    """Now accepts a dataframe directly."""
+    cols = [col for col in df.columns if 'Error' not in col]
     if 'Thermo_Valve_Temperature_DeviationPct' in cols:
         cols.remove('Thermo_Valve_Temperature_DeviationPct')
     return [str(c) for c in cols]
 
-
 @st.cache_data
-def load_my_sensor_data(file_obj, col='32', outlier_factor=3.0, outlier_window=42):
+def load_my_sensor_data(df, col='32', outlier_factor=3.0, outlier_window=42):
+    """Now accepts a dataframe instead of a file object."""
     freq = '4h'
-    file_obj.seek(0)
-    df = pd.read_csv(file_obj, parse_dates=['DateTime'])
+    df_resampled = df.resample(freq).mean(numeric_only=True)
 
-    df.set_index('DateTime', inplace=True)
-    df = df[~df.index.duplicated(keep='first')]
-    df = df.resample(freq).mean(numeric_only=True)
+    if col not in df_resampled.columns:
+        return pd.Series(), pd.Series(), pd.Series()
 
-    cols = [c for c in df.columns if 'Error' not in c]
-    if 'Thermo_Valve_Temperature_DeviationPct' in cols:
-        cols.remove('Thermo_Valve_Temperature_DeviationPct')
-
-    df_select = df[cols]
+    df_select = df_resampled[[col]].copy()
     df_select = df_select.interpolate(method='time', limit=1)
     df_select = rolling_iqr_filter(df_select, factor=outlier_factor, window=outlier_window)
 
-    # ROBUSTNESS: explicit .copy() to avoid SettingWithCopyWarning / cache aliasing.
-    df_defect = df_select.copy()
     window = int(1 * 24 / 4)
+    df_select[f'{col}_max'] = df_select[col].rolling(window=window * 5, min_periods=1).max()
+    df_select[f'{col}_max_ema'] = df_select[f'{col}_max'].ewm(span=window * 5, adjust=False, ignore_na=True).mean()
 
-    df_defect[f'{col}_max'] = df_defect[f'{col}'].rolling(window=window * 5, min_periods=1).max()
-    df_defect[f'{col}_max_ema'] = df_defect[f'{col}_max'].ewm(span=window * 5, adjust=False, ignore_na=True).mean()
+    df_daily = df_select.resample('D').mean()
+    df_daily['elapsed_days'] = (df_daily.index - df_daily.index.min()).days
 
-    df_defect_daily = df_defect.resample('D').mean()
-    df_defect_daily['elapsed_days'] = (df_defect_daily.index - df_defect_daily.index.min()).days
-
-    return df_defect_daily[f'{col}_max_ema'], df_defect_daily[f'{col}_max'], df_defect_daily['elapsed_days']
-
+    return df_daily[f'{col}_max_ema'], df_daily[f'{col}_max'], df_daily['elapsed_days']
 
 # ---------------------------------------------------------
 # 6. Headless Math Engine (No Plotly rendering for speed)
@@ -1323,6 +1415,120 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
         with st.expander("View Raw Simulation Logs"):
             st.dataframe(st.session_state['sim_results'], use_container_width=True)
 
+def page_synthetic_studio(base_df):
+    st.title("🧪 Synthetic Data Studio")
+    st.markdown("Inject deterministic faults into your fleet data to benchmark the predictive algorithms.")
+
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("1. Inject Faults into Healthy Assets")
+        num_healthy = st.number_input("Synthetic Healthy Channels to Create", min_value=0, max_value=20, value=3)
+        healthy_thresh = st.number_input("Max value to be considered 'Healthy'", value=0.2, step=0.1)
+        st.markdown("**Fault Profile Mix (Weights)**")
+        w_lin = st.slider("Linear Ramp", 0, 5, 1)
+        w_exp = st.slider("Exponential Curve", 0, 5, 1)
+        w_step = st.slider("Step Change", 0, 5, 1)
+        
+    with col2:
+        st.subheader("2. Mutate Unhealthy Assets")
+        num_unhealthy = st.number_input("Mutated Unhealthy Channels to Create", min_value=0, max_value=20, value=3)
+        unhealthy_thresh = st.number_input("Min value to be considered 'Unhealthy'", value=0.2, step=0.1)
+        st.markdown("**Mutation Mix (Weights)**")
+        w_warp = st.slider("Time-Warping (Speed up / Slow down)", 0, 5, 1)
+        w_drift = st.slider("Baseline Drift", 0, 5, 1)
+        w_noise = st.slider("Tail Noise Amplification", 0, 5, 1)
+
+    if st.button("🧬 Generate Synthetic Fleet", type="primary"):
+        with st.spinner("Analyzing fleet and generating synthetic profiles..."):
+            channels = get_available_channels(base_df)
+            
+            # Identify healthy vs unhealthy pools
+            healthy_pool = []
+            unhealthy_pool = []
+            
+            for ch in channels:
+                max_val = base_df[ch].max(skipna=True)
+                if max_val < healthy_thresh:
+                    healthy_pool.append(ch)
+                elif max_val >= unhealthy_thresh:
+                    unhealthy_pool.append(ch)
+                    
+            if not healthy_pool and num_healthy > 0:
+                st.error("No healthy channels found below your threshold. Cannot generate healthy synthetics.")
+                return
+            if not unhealthy_pool and num_unhealthy > 0:
+                st.error("No unhealthy channels found above your threshold. Cannot mutate unhealthy channels.")
+                return
+
+            # --- THE ISOLATION LOGIC ---
+            # Create a blank dataframe using the same time index
+            synth_df = pd.DataFrame(index=base_df.index)
+            
+            # Copy over the original unhealthy channels for reference
+            for ch in unhealthy_pool:
+                synth_df[ch] = base_df[ch].copy()
+
+            generated_count = 0
+
+            # --- Pipeline 1: Healthy to Fault ---
+            if num_healthy > 0:
+                fault_types = ["Linear", "Exponential", "Step"]
+                fault_weights = [w_lin, w_exp, w_step]
+                
+                for i in range(num_healthy):
+                    ch = np.random.choice(healthy_pool)
+                    # Pull the raw array from the base_df
+                    arr = base_df[ch].values.copy()
+                    
+                    # Start fault somewhere between 40% and 80% of asset life
+                    valid_indices = np.where(~np.isnan(arr))[0]
+                    if len(valid_indices) < 50:
+                        continue
+                    
+                    start_idx = valid_indices[int(len(valid_indices) * np.random.uniform(0.4, 0.8))]
+                    f_type = np.random.choice(fault_types, p=np.array(fault_weights)/sum(fault_weights))
+                    
+                    if f_type == "Linear":
+                        arr = add_linear_ramp(arr, start_idx, max_offset=np.random.uniform(0.5, 1.5))
+                    elif f_type == "Exponential":
+                        arr = add_exponential_curve(arr, start_idx, severity_factor=np.random.uniform(0.5, 2.0))
+                    elif f_type == "Step":
+                        arr = add_step_change(arr, start_idx, offset=np.random.uniform(0.3, 0.8))
+                        
+                    # Save to the isolated synth_df
+                    synth_df[f"SYN_H_{i+1}_{f_type}"] = arr
+                    generated_count += 1
+
+            # --- Pipeline 2: Mutating Unhealthy ---
+            if num_unhealthy > 0:
+                mut_types = ["TimeWarp", "Drift", "Noise"]
+                mut_weights = [w_warp, w_drift, w_noise]
+                
+                for j in range(num_unhealthy):
+                    ch = np.random.choice(unhealthy_pool)
+                    # Pull the raw array from the base_df
+                    arr = base_df[ch].values.copy()
+                    
+                    # Assume structural break happened around the time it hit the threshold
+                    crossings = np.where(arr >= unhealthy_thresh)[0]
+                    start_idx = crossings[0] if len(crossings) > 0 else len(arr) // 2
+                    m_type = np.random.choice(mut_types, p=np.array(mut_weights)/sum(mut_weights))
+                    
+                    if m_type == "TimeWarp":
+                        arr = stretch_or_squeeze_time(arr, start_idx, factor=np.random.uniform(0.5, 1.5))
+                    elif m_type == "Drift":
+                        arr = add_baseline_drift(arr, drift_max=np.random.uniform(0.2, 0.6))
+                    elif m_type == "Noise":
+                        arr = inject_tail_noise(arr, start_idx, noise_multiplier=np.random.uniform(2.0, 4.0))
+                        
+                    # Save to the isolated synth_df
+                    synth_df[f"SYN_UH_{j+1}_{m_type}"] = arr
+                    generated_count += 1
+
+            # Save to global session state
+            st.session_state['synthetic_df'] = synth_df
+            st.success(f"✅ Generated {generated_count} synthetic channels! You can now toggle the Data Source in the sidebar.")
 
 
 # ---------------------------------------------------------
@@ -1332,7 +1538,7 @@ def main():
     st.set_page_config(page_title="RUL Predictor", layout="wide")
 
     st.sidebar.title("🧭 Navigation")
-    app_mode = st.sidebar.radio("Select View:", ["Deep-Dive Analysis", "Live Fleet Simulation"])
+    app_mode = st.sidebar.radio("Select View:", ["Deep-Dive Analysis", "Live Fleet Simulation", "Synthetic Data Studio"])
     st.sidebar.markdown("---")
 
     st.sidebar.header("📁 Data Input")
@@ -1342,6 +1548,17 @@ def main():
         st.info("👋 Welcome! Please upload your sensor data CSV in the sidebar to begin.")
         st.stop()
 
+    # Parse the CSV once
+    base_df = parse_raw_csv(uploaded_file)
+    active_df = base_df
+
+    # --- THE DATA SWITCHER ---
+    if 'synthetic_df' in st.session_state:
+        st.sidebar.markdown("### 🧬 Data Source")
+        data_toggle = st.sidebar.radio("Active Dataset:", ["Original Fleet", "Synthetic Fault Fleet"])
+        if data_toggle == "Synthetic Fault Fleet":
+            active_df = st.session_state['synthetic_df']
+
     # =========================================================
     # MOVED UP: DEEP-DIVE SETTINGS (Visual placement only)
     # =========================================================
@@ -1349,17 +1566,19 @@ def main():
     if app_mode == "Deep-Dive Analysis":
         st.sidebar.markdown("---")
         st.sidebar.header("🔍 Deep-Dive Settings")
-        
-        raw_channels = get_available_channels(uploaded_file)
+
+        raw_channels = get_available_channels(active_df)
         display_options = []
         for c in raw_channels:
             if c in ['32', '73']:
                 display_options.append(f"{c} (Outlier/Deviating)")
+            elif c.startswith("SYN_"):
+                display_options.append(f"🧪 {c}")
             else:
                 display_options.append(c)
 
         selected_display = st.sidebar.selectbox("1. Select Data Channel", options=display_options)
-        selected_col = selected_display.split(" ")[0]
+        selected_col = selected_display.split(" ")[-1] if "🧪" in selected_display else selected_display.split(" ")[0]
 
     # =========================================================
     # SHARED PARAMETERS
@@ -1427,17 +1646,20 @@ def main():
     max_rul = RUL_HORIZON
 
     # =========================================================
-    # PAGE 1: DEEP-DIVE ANALYSIS
+    # PAGE ROUTER (Main Area)
     # =========================================================
-    if app_mode == "Deep-Dive Analysis":
+    if app_mode == "Synthetic Data Studio":
+        page_synthetic_studio(base_df)  # Always generate from the clean base_df
+
+    elif app_mode == "Deep-Dive Analysis":
         # Data loading now happens here, safely AFTER all sidebar parameters are set
         sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(
-            uploaded_file, col=selected_col, outlier_factor=outlier_factor, outlier_window=outlier_window
+            active_df, col=selected_col, outlier_factor=outlier_factor, outlier_window=outlier_window
         )
 
         # --- Dynamic Structural Break Router ---
         if break_algo == "Fleet Z-Score":
-            fleet_mean, fleet_std = compute_fleet_baseline(uploaded_file, outlier_factor, outlier_window)
+            fleet_mean, fleet_std = compute_fleet_baseline(active_df, outlier_factor, outlier_window)
             break_idx, break_time, _eval_start_idx = detect_zscore_break(
                 time_arr, sensor_arr_smooth, fleet_mean, fleet_std, z_factor, z_sustained
             )
@@ -1542,12 +1764,10 @@ def main():
                 else:
                     st.info("No threshold data available for this model fit.")
 
-    # =========================================================
-    # PAGE 2: LIVE FLEET SIMULATION
-    # =========================================================
     elif app_mode == "Live Fleet Simulation":
+        # Pass active_df into the simulation
         page_live_simulation(
-            uploaded_file, user_priority_dict, outlier_factor, outlier_window,
+            active_df, user_priority_dict, outlier_factor, outlier_window,
             use_dynamic_variance, break_algo, break_window, break_step, break_sustained, 
             z_factor, z_sustained, override_model, manual_model, 
             window_size, eval_window
