@@ -2100,6 +2100,12 @@ def main():
     override_model = st.sidebar.toggle("Enable Manual Selection", value=False)
     manual_model = st.sidebar.selectbox("Force specific model:", options=AVAILABLE_MODELS, disabled=not override_model)
 
+    # Dynamic warning prefix based on the active page
+    if app_mode == "Fleet RUL Benchmark":
+        sim_warn = "[Requires Simulation Re-run] "
+    else:
+        sim_warn = "[Updates Instantly] "
+        
     st.sidebar.markdown("### Structural Break Algorithm")
     break_algo = st.sidebar.radio(
         "Detection Method:",
@@ -2110,7 +2116,7 @@ def main():
     if break_algo == "Exponential vs Linear":
         break_window = st.sidebar.number_input(
             "Evaluation Window (Days)", min_value=10, max_value=200, value=60, step=10,
-            help="[Requires Simulation Re-run] The size of the moving window used to compare models. A larger window is more stable against noise but might detect the bend slightly later."
+            help="{sim_warn} The size of the moving window used to compare models. A larger window is more stable against noise but might detect the bend slightly later."
         )
         col_s, col_t = st.sidebar.columns(2)
         with col_s:
@@ -2121,18 +2127,18 @@ def main():
         with col_t:
             break_sustained = st.number_input(
                 "Sustained Wins", min_value=1, max_value=10, value=2, step=1,
-                help="[Requires Simulation Re-run] Consecutive times the Exponential curve must beat the Linear line to confirm a true break. Prevents false alarms from sudden noise spikes."
+                help="{sim_warn} Consecutive times the Exponential curve must beat the Linear line to confirm a true break. Prevents false alarms from sudden noise spikes."
             )
         z_factor = None
         z_sustained = None
     else:
         z_factor = st.sidebar.number_input(
             "Z-Score Multiplier", min_value=1.0, max_value=10.0, value=3.0, step=0.5,
-            help="[Requires Simulation Re-run] The statistical anomaly threshold. A value of 3.0 means the signal must exceed 3 standard deviations above the historical fleet baseline."
+            help="{sim_warn} The statistical anomaly threshold. A value of 3.0 means the signal must exceed 3 standard deviations above the historical fleet baseline."
         )
         z_sustained = st.sidebar.number_input(
             "Sustained Points (Days)", min_value=1, max_value=20, value=3, step=1,
-            help="[Requires Simulation Re-run] Consecutive days the signal must remain above the Z-Score threshold to be classified as a confirmed structural break."
+            help="{sim_warn} Consecutive days the signal must remain above the Z-Score threshold to be classified as a confirmed structural break."
         )
         break_window = None
         break_step = None
