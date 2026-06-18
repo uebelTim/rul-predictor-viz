@@ -1470,13 +1470,13 @@ def page_synthetic_studio(base_df):
         st.markdown("<br>**Mutation Mix (Weights)**", unsafe_allow_html=True)
         st.caption("Distort existing failure signatures to test algorithm robustness.")
         
-        st.markdown("** Time-Warping** | *Tests varied workloads (faster/slower failures)*")
+        st.markdown("**Time-Warping** | *Tests varied workloads (faster/slower failures)*")
         w_warp = st.slider("Time-Warping Weight", 0, 5, 1, label_visibility="collapsed")
         
-        st.markdown("** Baseline Drift** | *Tests sensor aging/calibration drift (prevents false early alarms)*")
+        st.markdown("**Baseline Drift** | *Tests sensor aging/calibration drift (prevents false early alarms)*")
         w_drift = st.slider("Baseline Drift Weight", 0, 5, 1, label_visibility="collapsed")
         
-        st.markdown("* Tail Noise** | *Tests violent chatter near failure (challenges the outlier filter)*")
+        st.markdown("*Tail Noise** | *Tests violent chatter near failure (challenges the outlier filter)*")
         w_noise = st.slider("Tail Noise Weight", 0, 5, 1, label_visibility="collapsed")
 
     st.markdown("---")
