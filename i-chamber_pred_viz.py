@@ -1415,40 +1415,91 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
         with st.expander("View Raw Simulation Logs"):
             st.dataframe(st.session_state['sim_results'], use_container_width=True)
 
-def page_synthetic_studio(base_df):
+# ---------------------------------------------------------
+# 6. Synthetic Data Studio Page
+# ---------------------------------------------------------
+def page_synthetic_studio(base_df, outlier_factor, outlier_window):
     st.title("🧪 Synthetic Data Studio")
-    st.markdown("Inject deterministic faults into your fleet data to benchmark the predictive algorithms.")
+    
+    with st.expander("📖 Guide: The Physics of Synthetic Testing", expanded=True):
+        st.markdown("""
+        **The Goal:** Prove that your predictive algorithms work before a real machine catastrophically fails. 
+        This studio safely isolates your original data and generates artificial failure scenarios to benchmark your engine.
+        
+        **We use two distinct testing strategies:**
+        * **1. Fault Injection (Testing Detection):** We take a perfectly healthy sensor and force it to fail at a random time. This proves the engine can catch *new* degradation it has never seen before.
+        * **2. Fault Mutation (Testing Robustness):** We take an asset that already failed and distort its signal. This proves the engine won't break or false-alarm when exposed to noisy environments, sensor drift, or changing machine workloads.
+        """)
 
+    st.markdown("---")
+    
     col1, col2 = st.columns(2)
     
     with col1:
         st.subheader("1. Inject Faults into Healthy Assets")
-        num_healthy = st.number_input("Synthetic Healthy Channels to Create", min_value=0, max_value=20, value=3)
-        healthy_thresh = st.number_input("Max value to be considered 'Healthy'", value=0.2, step=0.1)
-        st.markdown("**Fault Profile Mix (Weights)**")
-        w_lin = st.slider("Linear Ramp", 0, 5, 1)
-        w_exp = st.slider("Exponential Curve", 0, 5, 1)
-        w_step = st.slider("Step Change", 0, 5, 1)
+        num_healthy = st.number_input(
+            "Synthetic Healthy Channels to Create", min_value=0, max_value=20, value=3
+        )
+        healthy_thresh = st.number_input(
+            "Max value to be considered 'Healthy'", value=0.2, step=0.1,
+            help="Filters the fleet. Only channels whose smoothed maximum stays below this value will be used as baselines."
+        )
+        
+        st.markdown("<br>**Fault Profile Mix (Weights)**", unsafe_allow_html=True)
+        st.caption("Adjust sliders to control how often each physical fault type is generated.")
+        
+        st.markdown("**📈 Linear Ramp** | *Gradual wear (e.g., abrasive wear, filter clogging)*")
+        w_lin = st.slider("Linear Ramp Weight", 0, 5, 1, label_visibility="collapsed")
+        
+        st.markdown("**🚀 Exponential Curve** | *Compounding damage (e.g., crack propagation, thermal runaway)*")
+        w_exp = st.slider("Exponential Weight", 0, 5, 1, label_visibility="collapsed")
+        
+        st.markdown("**⚡ Step Change** | *Sudden discrete event (e.g., snapped belt, blown seal, bumped sensor)*")
+        w_step = st.slider("Step Change Weight", 0, 5, 1, label_visibility="collapsed")
         
     with col2:
         st.subheader("2. Mutate Unhealthy Assets")
-        num_unhealthy = st.number_input("Mutated Unhealthy Channels to Create", min_value=0, max_value=20, value=3)
-        unhealthy_thresh = st.number_input("Min value to be considered 'Unhealthy'", value=0.2, step=0.1)
-        st.markdown("**Mutation Mix (Weights)**")
-        w_warp = st.slider("Time-Warping (Speed up / Slow down)", 0, 5, 1)
-        w_drift = st.slider("Baseline Drift", 0, 5, 1)
-        w_noise = st.slider("Tail Noise Amplification", 0, 5, 1)
+        num_unhealthy = st.number_input(
+            "Mutated Unhealthy Channels to Create", min_value=0, max_value=20, value=3
+        )
+        unhealthy_thresh = st.number_input(
+            "Min value to be considered 'Unhealthy'", value=0.2, step=0.1,
+            help="Filters the fleet. Only channels that eventually cross this threshold will be used as baselines."
+        )
+        
+        st.markdown("<br>**Mutation Mix (Weights)**", unsafe_allow_html=True)
+        st.caption("Distort existing failure signatures to test algorithm robustness.")
+        
+        st.markdown("**⏱️ Time-Warping** | *Tests varied workloads (faster/slower failures)*")
+        w_warp = st.slider("Time-Warping Weight", 0, 5, 1, label_visibility="collapsed")
+        
+        st.markdown("**↗️ Baseline Drift** | *Tests sensor aging/calibration drift (prevents false early alarms)*")
+        w_drift = st.slider("Baseline Drift Weight", 0, 5, 1, label_visibility="collapsed")
+        
+        st.markdown("**📳 Tail Noise** | *Tests violent chatter near failure (challenges the outlier filter)*")
+        w_noise = st.slider("Tail Noise Weight", 0, 5, 1, label_visibility="collapsed")
 
-    if st.button("🧬 Generate Synthetic Fleet", type="primary"):
+    st.markdown("---")
+
+    if st.button("🧬 Generate Synthetic Fleet", type="primary", use_container_width=True):
         with st.spinner("Analyzing fleet and generating synthetic profiles..."):
             channels = get_available_channels(base_df)
             
-            # Identify healthy vs unhealthy pools
             healthy_pool = []
             unhealthy_pool = []
             
             for ch in channels:
-                max_val = base_df[ch].max(skipna=True)
+                # Run the data through your actual filter so noise spikes are ignored
+                sensor_smooth, _, _ = load_my_sensor_data(
+                    base_df, col=ch, outlier_factor=outlier_factor, outlier_window=outlier_window
+                )
+                
+                # Skip channels that are entirely empty after cleaning
+                if len(sensor_smooth.dropna()) < 10:
+                    continue
+                    
+                max_val = sensor_smooth.max(skipna=True)
+                
                 if max_val < healthy_thresh:
                     healthy_pool.append(ch)
                 elif max_val >= unhealthy_thresh:
@@ -1461,76 +1512,75 @@ def page_synthetic_studio(base_df):
                 st.error("No unhealthy channels found above your threshold. Cannot mutate unhealthy channels.")
                 return
 
-            # --- THE ISOLATION LOGIC ---
-            # Create a blank dataframe using the same time index
+            # ISOLATION: Create a fresh dataframe and only keep the original unhealthy channels
             synth_df = pd.DataFrame(index=base_df.index)
-            
-            # Copy over the original unhealthy channels for reference
             for ch in unhealthy_pool:
                 synth_df[ch] = base_df[ch].copy()
 
             generated_count = 0
 
-            # --- Pipeline 1: Healthy to Fault ---
+            # Pipeline 1: Healthy to Fault
             if num_healthy > 0:
                 fault_types = ["Linear", "Exponential", "Step"]
                 fault_weights = [w_lin, w_exp, w_step]
                 
-                for i in range(num_healthy):
-                    ch = np.random.choice(healthy_pool)
-                    # Pull the raw array from the base_df
-                    arr = base_df[ch].values.copy()
-                    
-                    # Start fault somewhere between 40% and 80% of asset life
-                    valid_indices = np.where(~np.isnan(arr))[0]
-                    if len(valid_indices) < 50:
-                        continue
-                    
-                    start_idx = valid_indices[int(len(valid_indices) * np.random.uniform(0.4, 0.8))]
-                    f_type = np.random.choice(fault_types, p=np.array(fault_weights)/sum(fault_weights))
-                    
-                    if f_type == "Linear":
-                        arr = add_linear_ramp(arr, start_idx, max_offset=np.random.uniform(0.5, 1.5))
-                    elif f_type == "Exponential":
-                        arr = add_exponential_curve(arr, start_idx, severity_factor=np.random.uniform(0.5, 2.0))
-                    elif f_type == "Step":
-                        arr = add_step_change(arr, start_idx, offset=np.random.uniform(0.3, 0.8))
+                if sum(fault_weights) > 0:
+                    for i in range(num_healthy):
+                        ch = np.random.choice(healthy_pool)
+                        arr = base_df[ch].values.copy()
                         
-                    # Save to the isolated synth_df
-                    synth_df[f"SYN_H_{i+1}_{f_type}"] = arr
-                    generated_count += 1
+                        valid_indices = np.where(~np.isnan(arr))[0]
+                        if len(valid_indices) < 50:
+                            continue
+                        
+                        start_idx = valid_indices[int(len(valid_indices) * np.random.uniform(0.4, 0.8))]
+                        f_type = np.random.choice(fault_types, p=np.array(fault_weights)/sum(fault_weights))
+                        
+                        if f_type == "Linear":
+                            arr = add_linear_ramp(arr, start_idx, max_offset=np.random.uniform(0.5, 1.5))
+                        elif f_type == "Exponential":
+                            arr = add_exponential_curve(arr, start_idx, severity_factor=np.random.uniform(0.5, 2.0))
+                        elif f_type == "Step":
+                            arr = add_step_change(arr, start_idx, offset=np.random.uniform(0.3, 0.8))
+                            
+                        # NEW NAMING CONVENTION
+                        new_col_name = f"INJECT_{f_type}_{i+1} (Base: {ch})"
+                        synth_df[new_col_name] = arr
+                        generated_count += 1
 
-            # --- Pipeline 2: Mutating Unhealthy ---
+            # Pipeline 2: Mutating Unhealthy
             if num_unhealthy > 0:
                 mut_types = ["TimeWarp", "Drift", "Noise"]
                 mut_weights = [w_warp, w_drift, w_noise]
                 
-                for j in range(num_unhealthy):
-                    ch = np.random.choice(unhealthy_pool)
-                    # Pull the raw array from the base_df
-                    arr = base_df[ch].values.copy()
-                    
-                    # Assume structural break happened around the time it hit the threshold
-                    crossings = np.where(arr >= unhealthy_thresh)[0]
-                    start_idx = crossings[0] if len(crossings) > 0 else len(arr) // 2
-                    m_type = np.random.choice(mut_types, p=np.array(mut_weights)/sum(mut_weights))
-                    
-                    if m_type == "TimeWarp":
-                        arr = stretch_or_squeeze_time(arr, start_idx, factor=np.random.uniform(0.5, 1.5))
-                    elif m_type == "Drift":
-                        arr = add_baseline_drift(arr, drift_max=np.random.uniform(0.2, 0.6))
-                    elif m_type == "Noise":
-                        arr = inject_tail_noise(arr, start_idx, noise_multiplier=np.random.uniform(2.0, 4.0))
+                if sum(mut_weights) > 0:
+                    for j in range(num_unhealthy):
+                        ch = np.random.choice(unhealthy_pool)
+                        arr = base_df[ch].values.copy()
                         
-                    # Save to the isolated synth_df
-                    synth_df[f"SYN_UH_{j+1}_{m_type}"] = arr
-                    generated_count += 1
+                        # Apply a quick local median to find the true crossing, ignoring raw spikes
+                        smooth_arr = pd.Series(arr).rolling(window=20, min_periods=1).median().values
+                        crossings = np.where(smooth_arr >= unhealthy_thresh)[0]
+                        start_idx = crossings[0] if len(crossings) > 0 else len(arr) // 2
+                        
+                        m_type = np.random.choice(mut_types, p=np.array(mut_weights)/sum(mut_weights))
+                        
+                        if m_type == "TimeWarp":
+                            arr = stretch_or_squeeze_time(arr, start_idx, factor=np.random.uniform(0.5, 1.5))
+                        elif m_type == "Drift":
+                            arr = add_baseline_drift(arr, drift_max=np.random.uniform(0.2, 0.6))
+                        elif m_type == "Noise":
+                            arr = inject_tail_noise(arr, start_idx, noise_multiplier=np.random.uniform(2.0, 4.0))
+                            
+                        # NEW NAMING CONVENTION
+                        new_col_name = f"MUTATE_{m_type}_{j+1} (Base: {ch})"
+                        synth_df[new_col_name] = arr
+                        generated_count += 1
 
-            # Save to global session state
             st.session_state['synthetic_df'] = synth_df
-            st.success(f"✅ Generated {generated_count} synthetic channels! You can now toggle the Data Source in the sidebar.")
-
-
+            st.success(f"✅ Generated {generated_count} synthetic channels! You can now toggle the Data Source in the sidebar to test them.")
+            
+            
 # ---------------------------------------------------------
 # 7. The Main UI Function (App Router)
 # ---------------------------------------------------------
