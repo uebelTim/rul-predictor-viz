@@ -1960,7 +1960,7 @@ def page_break_benchmark(active_df, base_df, is_synthetic, outlier_factor, outli
                 y="Channel", 
                 color="Status",
                 orientation='h',
-                title=f"Detection Latency per Channel (Green Zone = Perfect Hit $\pm${tol} Days)",
+                title=f"Detection Latency per Channel (Green Zone = Perfect Hit ±{tol} Days)",
                 color_discrete_map={
                     "True Positive (Hit)": "#4CAF50",
                     "False Positive (Fired Too Early)": "#FF9800",
