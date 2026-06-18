@@ -1435,8 +1435,7 @@ def page_synthetic_studio(base_df):
     
     with st.expander("📖 Guide: The Physics of Synthetic Testing", expanded=True):
         st.markdown("""
-        **The Goal:** Prove that your predictive algorithms work before a real machine catastrophically fails. 
-        This studio safely isolates your original data and generates artificial failure scenarios to benchmark your engine.
+        This studio safely isolates the original data and generates artificial failure scenarios to benchmark the prediction engine.
         
         **We use two distinct testing strategies:**
         * **1. Fault Injection (Testing Detection):** We take a perfectly healthy sensor and force it to fail at a random time. This proves the engine can catch *new* degradation it has never seen before.
