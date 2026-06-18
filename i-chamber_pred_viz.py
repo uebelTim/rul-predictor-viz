@@ -52,68 +52,52 @@ def rolling_iqr_filter(data, window=20, factor=1.5, center=True, keep_nans=True)
 # ---------------------------------------------------------
 # 1. The Standardized Mathematical Models
 # ---------------------------------------------------------
-def arctan_model(t, L, k, t0, d):
-    return L * (np.arctan(k * (t - t0)) / np.pi + 0.5) + d
-
-def gompertz_model(t, a, b, c, d):
-    return a * np.exp(-b * np.exp(-c * t)) + d
-
-def rational_model(t, a, b, d):
-    return (a * t) / (b + t) + d
-
 def linear_model(t, m, c):
     return m * t + c
 
-def softplus_model(t, a, b, t0, d):
-    return a * np.logaddexp(0, b * (t - t0)) + d
+def logarithmic_model(t, a, b, d):
+    # np.log1p(x) calculates log(1 + x), ensuring safe behavior at t=0
+    return a * np.log1p(np.clip(b * t, 0, np.inf)) + d
 
 def shifted_exponential_model(t, a, b, t0, d):
     return a * np.exp(np.clip(b * (t - t0), -50, 50)) + d
 
+def softplus_model(t, a, b, t0, d):
+    return a * np.logaddexp(0, b * (t - t0)) + d
+
+def gompertz_model(t, a, b, c, d):
+    return a * np.exp(-b * np.exp(-c * t)) + d
+
+def arctan_model(t, L, k, t0, d):
+    return L * (np.arctan(k * (t - t0)) / np.pi + 0.5) + d
+
+# Ordered by requested default priority (Highest to Lowest)
 AVAILABLE_MODELS = [
-    'Gompertz', 'Arctangent', 'Softplus',
-    'Shifted Exponential', 'Rational', 'Linear'
+    'Linear', 
+    'Logarithmic', 
+    'Shifted Exponential', 
+    'Softplus', 
+    'Gompertz'
 ]
 
 
 # ---------------------------------------------------------
 # 1b. CENTRALIZED MODEL CONFIG (single source of truth)
 # ---------------------------------------------------------
-# ROBUSTNESS FIX: previously the models_config dict was duplicated 3x with
-# inconsistent bounds (y_min+0.2 vs y_max+0.2 for the offset `d`). That could make
-# the leaderboard winner differ from the actually-fitted curve. Now one builder is
-# used everywhere, so bounds are guaranteed identical across all call sites.
 def build_models_config(y_min, y_max, y_range):
     d_lo = y_min - 0.2
     d_hi = y_max + 0.2  # use y_max consistently as the upper bound for offset d
     return {
-        'Rational': {
-            'func': rational_model,
-            'p0': [y_range, 0.5, y_min],
-            'bounds': ([0.0, 1e-3, d_lo], [np.inf, np.inf, d_hi]),
-        },
-        'Arctangent': {
-            'func': arctan_model,
-            'p0': [y_range * 1.1, 20.0, 0.5, y_min],
-            'bounds': ([y_range * 0.5, 0.1, 0.0, d_lo],
-                       [max(2.0, y_range * 2.2), 500.0, 1.0, d_hi]),
-        },
-        'Gompertz': {
-            'func': gompertz_model,
-            'p0': [y_range * 1.1, 1.0, 0.1, y_min],
-            'bounds': ([y_range * 0.8, 0.01, 1e-4, d_lo],
-                       [max(2.0, y_range * 2.2), 100.0, 50.0, d_hi]),
-        },
         'Linear': {
             'func': linear_model,
             'p0': [y_range, y_min],
             'bounds': ([-np.inf, d_lo], [np.inf, d_hi]),
         },
-        'Softplus': {
-            'func': softplus_model,
-            'p0': [y_range * 0.5, 10.0, 0.5, y_min],
-            'bounds': ([1e-3, 1e-3, 0.0, d_lo],
-                       [y_range * 10.0, 500.0, 1.0, d_hi]),
+        'Logarithmic': {
+            'func': logarithmic_model,
+            'p0': [y_range * 0.5, 10.0, y_min],
+            'bounds': ([1e-5, 1e-5, d_lo], 
+                       [y_range * 10.0, 500.0, d_hi]),
         },
         'Shifted Exponential': {
             'func': shifted_exponential_model,
@@ -121,21 +105,27 @@ def build_models_config(y_min, y_max, y_range):
             'bounds': ([1e-5, 0.01, 0.0, d_lo],
                        [y_range * 5.0, 50.0, 1.0, d_hi]),
         },
+        'Softplus': {
+            'func': softplus_model,
+            'p0': [y_range * 0.5, 10.0, 0.5, y_min],
+            'bounds': ([1e-3, 1e-3, 0.0, d_lo],
+                       [y_range * 10.0, 500.0, 1.0, d_hi]),
+        },
+        'Gompertz': {
+            'func': gompertz_model,
+            'p0': [y_range * 1.1, 1.0, 0.1, y_min],
+            'bounds': ([y_range * 0.8, 0.01, 1e-4, d_lo],
+                       [max(2.0, y_range * 2.2), 100.0, 50.0, d_hi]),
+        },
     }
 
-
 # ---------------------------------------------------------
-# 2. Master Fitting Function
+# 2. Master Fitting Function (AIC & Priority Router)
 # ---------------------------------------------------------
 def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=None,
-                        tolerance_pct=0.5, plot=False, verbose=True, Title_addon="",
+                        plot=False, verbose=True, Title_addon="",
                         save_name=None, warm_start=None, maxfev=10000):
-    """
-    OPT-A: Now stores the fitted `params` for every model so callers can reuse the
-    winner's fit instead of re-fitting (avoids the double-fit per timestep).
-    OPT-E: Accepts `warm_start` (dict model->params) to seed p0 from the previous
-    timestep, which cuts curve_fit iterations dramatically.
-    """
+    
     time_arr = np.asarray(time_data)
     sensor_arr = np.asarray(sensor_data)
 
@@ -160,7 +150,8 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
     for name, config in models_config.items():
         try:
             p0 = config['p0']
-            # OPT-E: warm-start from previous fit if it's within bounds.
+            k = len(p0)  # Number of parameters used for AIC penalty
+
             if warm_start is not None and name in warm_start and warm_start[name] is not None:
                 try:
                     p0 = np.clip(warm_start[name], config['bounds'][0], config['bounds'][1])
@@ -173,31 +164,48 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
             )
             preds = config['func'](t_fit, *params)
 
+            # Evaluate on the tail window if specified
             if eval_window is not None and eval_window < len(y_fit):
-                mse = mean_squared_error(y_fit[-eval_window:], preds[-eval_window:])
+                y_eval = y_fit[-eval_window:]
+                preds_eval = preds[-eval_window:]
+                n = len(y_eval)
             else:
-                mse = mean_squared_error(y_fit, preds)
+                y_eval = y_fit
+                preds_eval = preds
+                n = len(y_fit)
 
-            results[name] = {'params': params, 'mse': mse, 'func': config['func']}
+            mse = mean_squared_error(y_eval, preds_eval)
+            
+            # Tail-Weighted Pseudo-AIC Calculation
+            # Added 1e-10 to prevent math domain error if MSE is exactly 0
+            aic = n * np.log(mse + 1e-10) + 2 * k
+
+            results[name] = {'params': params, 'mse': mse, 'aic': aic, 'func': config['func']}
+            
         except Exception as e:
-            results[name] = {'params': None, 'mse': float('inf'),
+            results[name] = {'params': None, 'mse': float('inf'), 'aic': float('inf'),
                              'error': str(e), 'func': config['func']}
 
-    valid_results = {n: d for n, d in results.items() if d['mse'] != float('inf')}
+    # Filter out models that completely failed to converge
+    valid_results = {n: d for n, d in results.items() if d['aic'] != float('inf')}
     if not valid_results:
         return {}, results
 
-    best_math_mse = min(d['mse'] for d in valid_results.values())
-    # NOTE: tolerance_pct is a MULTIPLIER, not percentage points.
-    # 0.5 => "within 50% of the best MSE".
-    tolerance_threshold = best_math_mse * (1.0 + tolerance_pct)
+    # --- Step 1 & 2: Find the Best AIC ---
+    best_aic = min(d['aic'] for d in valid_results.values())
 
-    competitive_models = {n: d for n, d in valid_results.items()
-                          if d['mse'] <= tolerance_threshold}
+    # --- Step 3 & 4: Filter Competitive Models (Delta AIC <= 2.0) ---
+    competitive_models = {n: d for n, d in valid_results.items() if (d['aic'] - best_aic) <= 2.0}
+
+    # --- Step 5: Apply User Priority Ranking to break ties ---
+    # priority_ranking dict is structured as {'Linear': 1, 'Logarithmic': 2, ...}
+    # Lower number = higher priority
     top_models_sorted = dict(sorted(competitive_models.items(),
                                     key=lambda item: priority_ranking.get(item[0], 99)))
+
+    # Sort the full leaderboard for the UI display (purely by AIC score)
     full_leaderboard = dict(sorted(results.items(),
-                                   key=lambda item: item[1].get('mse', float('inf'))))
+                                   key=lambda item: item[1].get('aic', float('inf'))))
 
     return top_models_sorted, full_leaderboard
 
@@ -841,7 +849,9 @@ def generate_simulation_dashboards(raw_df):
     st.header("📊 Fleet Backtesting Results")
 
     st.markdown("### Operational Thresholds")
-    col_aw, col_hz = st.columns(2)
+    # Added a third column for the RUL Evaluation Mode
+    col_aw, col_hz, col_mode = st.columns(3)
+    
     with col_aw:
         action_window = st.slider(
             "Action Window (Days)", min_value=5, max_value=90, value=30, step=1,
@@ -852,12 +862,33 @@ def generate_simulation_dashboards(raw_df):
             "Safe Horizon (Days)", min_value=30, max_value=730, value=RUL_HORIZON, step=5,
             help="[Updates Instantly] The Safe Horizon. If both the predicted and actual RUL exceed this timeframe, it is considered a True Negative."
         )
+    with col_mode:
+        rul_mode = st.selectbox(
+            "RUL Evaluation Mode",
+            options=[
+                "Nominal (Center Line)", 
+                "Conservative (Early Alarm / Upper Band)", 
+                "Optimistic (Late Alarm / Lower Band)"
+            ],
+            help="[Updates Instantly] Choose which statistical confidence band to evaluate against the actual failure."
+        )
+
+    # Map the selected mode to the correct dataframe column
+    if "Conservative" in rul_mode:
+        eval_col = 'Upper_Risk_RUL'
+    elif "Optimistic" in rul_mode:
+        eval_col = 'Lower_Risk_RUL'
+    else:
+        eval_col = 'Nominal_RUL'
+
+    # Create a dynamic column that the rest of the dashboard will use
+    df['Selected_RUL'] = df[eval_col]
 
     # -----------------------------------------------------
     # HORIZON-CAPPED COLUMNS (continuous charts B & C only).
     # NaN actual/predicted ("never reached") -> full horizon so a position exists.
     # -----------------------------------------------------
-    df['Nominal_RUL_c'] = df['Nominal_RUL'].apply(lambda x: to_horizon(x, display_horizon))
+    df['Selected_RUL_c'] = df['Selected_RUL'].apply(lambda x: to_horizon(x, display_horizon))
     df['Actual_RUL_c']  = df['Actual_RUL'].apply(lambda x: to_horizon(x, display_horizon))
 
     # -----------------------------------------------------
@@ -867,7 +898,7 @@ def generate_simulation_dashboards(raw_df):
 
     # Treat NaN as infinite (never reaches threshold) for logical comparisons
     act_val = df['Actual_RUL'].fillna(np.inf)
-    pred_val = df['Nominal_RUL'].fillna(np.inf)
+    pred_val = df['Selected_RUL'].fillna(np.inf)
 
     # 1. True Negative: Both are safely beyond the display horizon
     is_tn = (act_val > display_horizon) & (pred_val > display_horizon)
@@ -889,7 +920,7 @@ def generate_simulation_dashboards(raw_df):
     # -----------------------------------------------------
     # BIAS SCORE: computed from CAPPED columns -> no NaN holes in Chart B.
     # -----------------------------------------------------
-    error = df['Nominal_RUL_c'] - df['Actual_RUL_c']
+    error = df['Selected_RUL_c'] - df['Actual_RUL_c']
     df['Bias_Score'] = np.clip((error + action_window) / (action_window * 2), 0.0, 1.0)
 
     df['Eval_Day_Rounded'] = df['Evaluation_Day'].round().astype(int)
@@ -900,7 +931,7 @@ def generate_simulation_dashboards(raw_df):
             return "Never reaches threshold (Safe)"
         return f"{x:.1f} Days"
 
-    df['Hover_Pred'] = df['Nominal_RUL'].apply(_fmt_pred)
+    df['Hover_Pred'] = df['Selected_RUL'].apply(_fmt_pred)
     df['Hover_Act'] = df['Actual_RUL'].apply(lambda x: f"{x:.1f} Days" if pd.notna(x) else "Never Breaches")
 
     pivot_pred = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Pred', aggfunc='first')
@@ -914,12 +945,11 @@ def generate_simulation_dashboards(raw_df):
     # ==========================================
     st.subheader("Chart A: Lifecycle Confusion Matrix (Categorical)")
     st.caption(
-        f"Each cell shows the model's classification for that day:  \n"
+        f"Each cell shows the model's classification for that day (using **{rul_mode}**):  \n"
         f"🟩 **True Positive:** The prediction was accurate within the ±{action_window}-day tolerance window.  \n"
         f"⬜ **True Negative:** Both actual and predicted RUL are safely beyond the {display_horizon}-day horizon.  \n"
         f"🟧 **False Positive:** The model alarmed too early (predicted failure earlier than actual).  \n"
         f"🟥 **False Negative:** The model alarmed too late or missed the failure entirely (predicted failure later than actual).  \n"
-        f"Use the time axis to identify whether a channel is over-alarming early in its life and stabilising later."
     )
 
     status_map = {"True Negative": 0, "False Positive": 1, "True Positive": 2, "False Negative": 3}
@@ -955,13 +985,10 @@ def generate_simulation_dashboards(raw_df):
     # ==========================================
     st.subheader("Chart B: Directional Bias Matrix (Continuous)")
     st.caption(
-        f"Shows the direction of each prediction's error, not only whether it was correct:  \n"
+        f"Shows the direction of each prediction's error against the **{rul_mode}**:  \n"
         f"Dark = conservative (predicted failure earlier than it occurred — the safe side).  \n"
         f"Light = optimistic (predicted failure later than it occurred — the risk side).  \n"
         f"Mid-tone = on target.  \n"
-        f"The scale saturates at ±{action_window} days (your action window). "
-        f"Channels that never cross the threshold are scored against the {display_horizon}-day "
-        f"safe horizon, so the algorithm's behaviour remains visible rather than blank."
     )
 
     rocket_palette = sns.color_palette("mako", n_colors=256).as_hex()
@@ -990,7 +1017,6 @@ def generate_simulation_dashboards(raw_df):
     # ==========================================
     st.subheader("Chart C: Prediction Scatter")
     
-    # 1. Add a toggle to filter the view
     scatter_mode = st.radio(
         "Chart C View Mode:",
         ["Finite predictions only (Recommended)", "All evaluations (Includes Safe/Never reaches)"],
@@ -1000,8 +1026,7 @@ def generate_simulation_dashboards(raw_df):
     df_scatter = df.copy()
 
     if scatter_mode == "Finite predictions only (Recommended)":
-        # Keep only rows where the algorithm predicted an actual numeric crossing
-        df_scatter = df_scatter[df_scatter['Nominal_RUL'].notna()].copy()
+        df_scatter = df_scatter[df_scatter['Selected_RUL'].notna()].copy()
         st.caption(
             "Showing only evaluations where the model predicted a finite crossing time. "
             "Points on the dashed diagonal are exact. Above the line = optimistic; below = conservative."
@@ -1013,11 +1038,9 @@ def generate_simulation_dashboards(raw_df):
             f"at {display_horizon} days (flattening along the top edge)."
         )
 
-    # 2. Prepare clean names for the hover tooltip
     df_scatter['Predicted RUL'] = df_scatter['Hover_Pred']
     df_scatter['Actual Outcome'] = df_scatter['Hover_Act']
 
-    # 3. Create the parking lane for "never breaches"
     real_actual_max = df_scatter['Actual_RUL'].max(skipna=True)
     if pd.isna(real_actual_max):
         real_actual_max = display_horizon
@@ -1028,13 +1051,12 @@ def generate_simulation_dashboards(raw_df):
         x_view_max = max(never_pos, action_window * 2) * 1.10
         y_view_max = display_horizon * 1.05
 
-        # 4. Build the scatter, hiding internal variables in the hover_data config
         fig_c = px.scatter(
-            df_scatter, x="Actual_RUL_plot", y="Nominal_RUL_c", color="Status",
+            df_scatter, x="Actual_RUL_plot", y="Selected_RUL_c", color="Status",
             hover_data={
-                "Actual_RUL_plot": False,  # Hide internal plot value
-                "Nominal_RUL_c": False,    # Hide internal capped value
-                "Status": False,           # Handled by the color label
+                "Actual_RUL_plot": False,  
+                "Selected_RUL_c": False,    
+                "Status": False,           
                 "Channel": True,
                 "Evaluation_Day": True,
                 "Predicted RUL": True,
@@ -1050,7 +1072,6 @@ def generate_simulation_dashboards(raw_df):
         fig_c.add_vline(x=action_window, line_width=1, line_dash="dot", line_color="gray")
         fig_c.add_hline(y=action_window, line_width=1, line_dash="dot", line_color="gray")
         
-        # Only draw the "Never crosses" parking lane if there are actually NaN values being plotted
         if df_scatter['Actual_RUL'].isna().any():
             fig_c.add_vline(x=never_pos, line_width=1, line_dash="dashdot", line_color="lightgray")
             fig_c.add_annotation(x=never_pos, y=y_view_max, yanchor="top", showarrow=False,
@@ -1059,48 +1080,38 @@ def generate_simulation_dashboards(raw_df):
             
         fig_c.add_hline(y=display_horizon, line_width=1, line_dash="dashdot", line_color="lightgray")
 
-        # Dynamic X-axis title based on the mode
         if scatter_mode == "Finite predictions only (Recommended)" and not df_scatter['Actual_RUL'].isna().any():
             x_title = "Actual outcome (Days)"
         else:
             x_title = "Actual outcome (Days; safe cases grouped at right)"
 
-        # 1. Find the absolute maximum between X and Y so both axes share the same scale
         max_range = max(x_view_max, y_view_max)
 
         fig_c.update_layout(
             xaxis_title=x_title,
-            yaxis_title=f"Predicted RUL (Days, capped @ {display_horizon})",
-            
-            # 2. Apply the identical range and lock the physical aspect ratio to 1:1
+            yaxis_title=f"Predicted RUL ({rul_mode.split(' ')[0]}, capped @ {display_horizon})",
             xaxis=dict(range=[0, max_range]), 
             yaxis=dict(
                 range=[0, max_range], 
-                scaleanchor="x",  # Locks Y axis physical pixels to X axis
-                scaleratio=1      # 1:1 aspect ratio
+                scaleanchor="x",  
+                scaleratio=1      
             ),
-            
-            width=1200,
-            height=800,
-            
-            # 3. Add explicit symmetric margins to prevent uneven squeezing
+            width=1200, height=800,
             margin=dict(l=80, r=80, t=100, b=80),
-            
             template="plotly_white",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
 
-        # Center the square chart nicely on the page
         col_left, col_center, col_right = st.columns([1, 3, 1])
         with col_center:
             st.plotly_chart(fig_c, use_container_width=False)
 
 
 
-
 def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_window,
                          use_dynamic_variance, break_algo, break_window, break_step, break_sustained,
-                         z_factor, z_sustained, override_model, manual_model):
+                         z_factor, z_sustained, override_model, manual_model,
+                         window_size, eval_window):
     st.title("Fleet-Wide Live Simulation")
     st.markdown("Run the predictive engine across all channels and all historical timesteps to generate statistical confidence metrics.")
 
@@ -1117,7 +1128,7 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
         step_days = st.number_input("Timestep Interval (Days)", min_value=1, max_value=30, value=7,
                                     help="[Requires Simulation Re-run] Days the simulation jumps between calculations.")
     with col3:
-        target_thresh = st.number_input("Target Threshold", min_value=0.1, max_value=5.0, value=0.5, step=0.1,
+        target_thresh = st.number_input("Target Threshold", min_value=0.1, max_value=5.0, value=0.2, step=0.1,
                                         help="[Requires Simulation Re-run] The critical limit line.")
     with col4:
         ema_span = st.number_input("EMA Smoothing Span", min_value=1, max_value=20, value=1, step=1,
@@ -1215,18 +1226,24 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                 return smoothed, smoothed
 
             for step_idx, current_cutoff in enumerate(timesteps):
-                hist_time = time_arr_np[:current_cutoff]
-                hist_smooth = smooth_np[:current_cutoff]
-                hist_raw = raw_np[:current_cutoff]  # OPT-F: slice of hoisted array
+                
+                # --- NEW SLICING LOGIC ---
+                # Ensure we only look back as far as the window_size allows
+                fit_start_idx = max(0, current_cutoff - window_size)
+                
+                hist_time = time_arr_np[fit_start_idx:current_cutoff]
+                hist_smooth = smooth_np[fit_start_idx:current_cutoff]
+                hist_raw = raw_np[fit_start_idx:current_cutoff] 
 
                 current_day = hist_time[-1]
 
-                # OPT-F: throttle UI updates
+                # Throttle UI updates
                 if step_idx % UI_THROTTLE == 0 or step_idx == total_steps - 1:
                     sub_status_text.markdown(f"↳ Evaluating Timestep **{step_idx + 1} / {total_steps}** (Day {current_day:.1f})")
                     sub_progress_bar.progress((step_idx + 1) / total_steps)
 
-                eval_win = min(50, len(hist_time))
+                # Cap the evaluation window to the available sliced data
+                eval_win = min(eval_window, len(hist_time))
 
                 # OPT-A + OPT-E: single competition pass; reuse winner's params for RUL.
                 if override_model:
@@ -1245,11 +1262,12 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                         warm_start=warm_start_cache  # OPT-E
                     )
 
-                    mse_log_str = "All models failed"
+                    # Log the AIC scores instead of MSE
+                    aic_log_str = "All models failed"
                     if all_models:
-                        mse_log_str = " | ".join(
-                            [f"{k}: {v['mse']:.5f}" for k, v in all_models.items()
-                             if v.get('mse', float('inf')) != float('inf')]
+                        aic_log_str = " | ".join(
+                            [f"{k}: {v['aic']:.2f}" for k, v in all_models.items() 
+                             if v.get('aic', float('inf')) != float('inf')]
                         )
 
                     if not top_models:
@@ -1260,7 +1278,7 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                         winner_params = top_models[best_model].get('params')
 
                     # OPT-E: refresh warm-start cache with all successfully-fitted params.
-                    warm_start_cache = {k: v.get('params') for k, v in all_models.items()
+                    warm_start_cache = {k: v.get('params') for k, v in all_models.items() 
                                         if v.get('params') is not None}
 
                     # OPT-A: pass winner params -> calculate_rul_headless does NOT re-fit.
@@ -1286,7 +1304,7 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                     'Nominal_RUL': store_n,     # NaN when model said "never reached"
                     'Upper_Risk_RUL': store_u,
                     'Lower_Risk_RUL': store_l,
-                    'All_Models_MSE': mse_log_str
+                    'All_Models_AIC': aic_log_str  # <--- Updated key here
                 })
 
             progress_bar.progress((idx + 1) / total_channels)
@@ -1326,6 +1344,16 @@ def main():
 
     st.sidebar.markdown("---")
     st.sidebar.header("🛠️ Shared Parameters")
+    
+    st.sidebar.markdown("### Predictive Model Context")
+    window_size = st.sidebar.number_input(
+        "Window Size (Lookback Days)", min_value=10, max_value=5000, value=300, step=10,
+        help="[Requires Simulation Re-run] Trailing days used to fit the predictive curves."
+    )
+    eval_window = st.sidebar.number_input(
+        "AIC Evaluation Window (Last N Days)", min_value=1, max_value=window_size, value=min(50, window_size), step=1,
+        help="[Requires Simulation Re-run] Recent days used to compute the Tail-Weighted AIC. Unlike simple error (MSE), AIC penalizes complex curves to prevent overfitting. A lower score is better."
+    )
 
     st.sidebar.markdown("### Outlier Filtering")
     outlier_factor = st.sidebar.slider("IQR Outlier Factor", min_value=0.5, max_value=10.0, value=3.0, step=0.1,
@@ -1369,10 +1397,19 @@ def main():
         break_step = None
         break_sustained = None
 
-    st.sidebar.markdown("### Router Priority Ranking")
-    with st.sidebar.expander("Configure Router Ranking", expanded=False):
+    st.sidebar.markdown("### Model Priority Ranking")
+    with st.sidebar.expander("Configure Model Ranking", expanded=False):
         st.caption("Drag and drop to set tie-breaker priority (Top = Highest Priority).")
-        sorted_models = sort_items(AVAILABLE_MODELS, direction='vertical')
+        
+        # Capture the output of the sortable list
+        raw_sorted = sort_items(AVAILABLE_MODELS, direction='vertical')
+        
+        # Fallback: if it returns None or empty during initial render, use the default list
+        if not raw_sorted:
+            sorted_models = AVAILABLE_MODELS
+        else:
+            sorted_models = raw_sorted
+            
         user_priority_dict = {model: rank for rank, model in enumerate(sorted_models, start=1)}
 
     # ROBUSTNESS: single horizon constant shared by both pages (no floating magic number).
@@ -1395,12 +1432,6 @@ def main():
 
         selected_display = st.sidebar.selectbox("1. Select Data Channel", options=display_options)
         selected_col = selected_display.split(" ")[0]
-
-        window_size = st.sidebar.number_input("2. Window Size (Lookback Days)", min_value=10, max_value=5000, value=300, step=10,
-                                              help="[Updates Instantly] Trailing days used for the predictive curves.")
-        eval_window = st.sidebar.number_input("3. MSE Eval Window (Last N Days)", min_value=1, max_value=window_size,
-                                              value=min(50, window_size), step=1,
-                                              help="[Updates Instantly] Recent days used to score/rank models.")
 
         sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(
             uploaded_file, col=selected_col, outlier_factor=outlier_factor, outlier_window=outlier_window
@@ -1461,21 +1492,41 @@ def main():
 
             with side_metrics_col:
                 st.markdown("### 📊 Model Router")
+                
+                # Fetch the absolute best AIC to calculate the Delta
+                best_aic_val = min([m.get('aic', float('inf')) for m in all_models.values()])
+                
                 leaderboard_data = []
                 for rank, (name, metrics) in enumerate(all_models.items(), start=1):
                     is_winner = (name == best_model_name)
+                    
+                    # Calculate Delta AIC for the display
+                    model_aic = metrics.get('aic', float('inf'))
+                    delta_aic = model_aic - best_aic_val if model_aic != float('inf') else float('inf')
+                    
                     leaderboard_data.append({
-                        "Rank": ("🏆 Override" if (is_winner and override_model)
-                                 else "🏆 Algorithm" if is_winner
-                                 else "🏆" if name in top_models.keys()
+                        "Rank": ("🏆 Override" if (is_winner and override_model) 
+                                 else "🏆 Algorithm" if is_winner 
+                                 else "🏆 Tied (Ranked lower)" if name in top_models.keys()
                                  else str(rank)),
                         "Model": name,
-                        "MSE": f"{metrics['mse']:.5f}"
+                        "AIC": f"{model_aic:.2f}" if model_aic != float('inf') else "Failed",
+                        "Δ AIC": f"+{delta_aic:.2f}" if delta_aic != float('inf') else "N/A"
                     })
+                
                 st.dataframe(pd.DataFrame(leaderboard_data), use_container_width=True, hide_index=True)
+                
+                # Add the UI explanation for the Delta AIC logic
+                st.caption(
+                    "**How the Algorithm Chooses:** \n"
+                    "The engine uses the **Akaike Information Criterion (AIC)**. "
+                    "Models with a **Δ AIC ≤ 2.0** are considered mathematically tied. "
+                    "When a tie occurs, the engine defers to your Priority Ranking to select the most physically realistic model."
+                )
 
                 st.markdown("---")
                 st.markdown("### ⏳ RUL Projections")
+                
                 if not rul_df.empty:
                     display_rul_df = rul_df[['Threshold', 'Status', 'Nominal_RUL', 'Upper_Band_RUL', 'Lower_Band_RUL']].copy()
 
@@ -1505,8 +1556,9 @@ def main():
     elif app_mode == "Live Fleet Simulation":
         page_live_simulation(
             uploaded_file, user_priority_dict, outlier_factor, outlier_window,
-            use_dynamic_variance, break_window, break_step, break_sustained, override_model, manual_model,
-            break_algo, z_factor, z_sustained
+            use_dynamic_variance, break_algo, break_window, break_step, break_sustained, 
+            z_factor, z_sustained, override_model, manual_model, 
+            window_size, eval_window  # <--- Added here
         )
 
 
