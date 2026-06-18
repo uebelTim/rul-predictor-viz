@@ -1448,13 +1448,13 @@ def page_synthetic_studio(base_df):
         st.markdown("<br>**Fault Profile Mix (Weights)**", unsafe_allow_html=True)
         st.caption("Adjust sliders to control how often each physical fault type is generated.")
         
-        st.markdown("**📈 Linear Ramp** | *Gradual wear (e.g., abrasive wear, filter clogging)*")
+        st.markdown("** Linear Ramp** | *Gradual wear (e.g., abrasive wear, filter clogging)*")
         w_lin = st.slider("Linear Ramp Weight", 0, 5, 1, label_visibility="collapsed")
         
-        st.markdown("**🚀 Exponential Curve** | *Compounding damage (e.g., crack propagation, thermal runaway)*")
+        st.markdown("** Exponential Curve** | *Compounding damage (e.g., crack propagation, thermal runaway)*")
         w_exp = st.slider("Exponential Weight", 0, 5, 1, label_visibility="collapsed")
         
-        st.markdown("**⚡ Step Change** | *Sudden discrete event (e.g., snapped belt, blown seal, bumped sensor)*")
+        st.markdown("** Step Change** | *Sudden discrete event (e.g., snapped belt, blown seal, bumped sensor)*")
         w_step = st.slider("Step Change Weight", 0, 5, 1, label_visibility="collapsed")
         
     with col2:
@@ -1470,13 +1470,13 @@ def page_synthetic_studio(base_df):
         st.markdown("<br>**Mutation Mix (Weights)**", unsafe_allow_html=True)
         st.caption("Distort existing failure signatures to test algorithm robustness.")
         
-        st.markdown("**⏱️ Time-Warping** | *Tests varied workloads (faster/slower failures)*")
+        st.markdown("** Time-Warping** | *Tests varied workloads (faster/slower failures)*")
         w_warp = st.slider("Time-Warping Weight", 0, 5, 1, label_visibility="collapsed")
         
-        st.markdown("**↗️ Baseline Drift** | *Tests sensor aging/calibration drift (prevents false early alarms)*")
+        st.markdown("** Baseline Drift** | *Tests sensor aging/calibration drift (prevents false early alarms)*")
         w_drift = st.slider("Baseline Drift Weight", 0, 5, 1, label_visibility="collapsed")
         
-        st.markdown("**📳 Tail Noise** | *Tests violent chatter near failure (challenges the outlier filter)*")
+        st.markdown("* Tail Noise** | *Tests violent chatter near failure (challenges the outlier filter)*")
         w_noise = st.slider("Tail Noise Weight", 0, 5, 1, label_visibility="collapsed")
 
     st.markdown("---")
@@ -1577,8 +1577,7 @@ def page_synthetic_studio(base_df):
             st.session_state['synthetic_df'] = synth_df
             st.success(f"✅ Generated {generated_count} synthetic channels in milliseconds! Toggle the Data Source in the sidebar to test them.")
             
-            
-# ---------------------------------------------------------
+ # ---------------------------------------------------------
 # 7. The Main UI Function (App Router)
 # ---------------------------------------------------------
 def main():
@@ -1607,28 +1606,44 @@ def main():
             active_df = st.session_state['synthetic_df']
 
     # =========================================================
-    # MOVED UP: DEEP-DIVE SETTINGS (Visual placement only)
+    # CHANNEL SELECTOR (Top of Sidebar)
     # =========================================================
     selected_col = None
     if app_mode == "Deep-Dive Analysis":
         st.sidebar.markdown("---")
-        st.sidebar.header("🔍 Deep-Dive Settings")
+        st.sidebar.header("🎯 Channel Selector")
 
         raw_channels = get_available_channels(active_df)
-        display_options = []
-        for c in raw_channels:
-            if c in ['32', '73']:
-                display_options.append(f"{c} (Outlier/Deviating)")
-            elif c.startswith("SYN_"):
-                display_options.append(f"🧪 {c}")
-            else:
-                display_options.append(c)
+        
+        synth_options = []
+        base_options = []
+        display_to_col = {} # Safe dictionary mapping
 
-        selected_display = st.sidebar.selectbox("1. Select Data Channel", options=display_options)
-        selected_col = selected_display.split(" ")[-1] if "🧪" in selected_display else selected_display.split(" ")[0]
+        for c in raw_channels:
+            if c.startswith("INJECT_") or c.startswith("MUTATE_"):
+                disp_name = f"🧪 {c}"
+                display_to_col[disp_name] = c
+                synth_options.append(disp_name)
+            elif c in ['32', '73']:
+                disp_name = f"{c} (Outlier/Deviating)"
+                display_to_col[disp_name] = c
+                base_options.append(disp_name)
+            else:
+                display_to_col[c] = c
+                base_options.append(c)
+
+        # Sort so Synthetic are ALWAYS at the top, then base options alphabetically
+        synth_options.sort()
+        base_options.sort()
+        display_options = synth_options + base_options
+
+        selected_display = st.sidebar.selectbox("Select Data Channel to Analyze", options=display_options)
+        
+        # Safely fetch the exact column name
+        selected_col = display_to_col[selected_display]
 
     # =========================================================
-    # SHARED PARAMETERS
+    # SHARED PARAMETERS (Middle of Sidebar)
     # =========================================================
     st.sidebar.markdown("---")
     st.sidebar.header("🛠️ Shared Parameters")
@@ -1696,42 +1711,10 @@ def main():
     # PAGE ROUTER (Main Area)
     # =========================================================
     if app_mode == "Synthetic Data Studio":
-        page_synthetic_studio(base_df)  # Always generate from the clean base_df
+        page_synthetic_studio(base_df)
 
     elif app_mode == "Deep-Dive Analysis":
-        # Data loading now happens here, safely AFTER all sidebar parameters are set
-        raw_channels = get_available_channels(active_df)
-        
-        synth_options = []
-        base_options = []
-        display_to_col = {} # Safe dictionary mapping
-
-        for c in raw_channels:
-            if c.startswith("INJECT_") or c.startswith("MUTATE_"):
-                disp_name = f"🧪 {c}"
-                display_to_col[disp_name] = c
-                synth_options.append(disp_name)
-            elif c in ['32', '73']:
-                disp_name = f"{c} (Outlier/Deviating)"
-                display_to_col[disp_name] = c
-                base_options.append(disp_name)
-            else:
-                display_to_col[c] = c
-                base_options.append(c)
-
-        # Sort so Synthetic are ALWAYS at the top, then base options alphabetically
-        synth_options.sort()
-        base_options.sort()
-        display_options = synth_options + base_options
-
-        st.sidebar.markdown("---")
-        st.sidebar.header("🔍 Deep-Dive Settings")
-        selected_display = st.sidebar.selectbox("1. Select Data Channel", options=display_options)
-        
-        # FIX: Use the dictionary to get the exact column name! No string splitting!
-        selected_col = display_to_col[selected_display]
-
-        # Load the data using the exact, correct column name
+        # Load the data using the selected_col defined in the top Channel Selector
         sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(
             active_df, col=selected_col, outlier_factor=outlier_factor, outlier_window=outlier_window
         )
@@ -1751,7 +1734,17 @@ def main():
         thresholds = [0.2, 0.5, 1.0]
 
         st.markdown("### Time Navigation")
-        cutoff_idx = st.slider("Select the Current Time Point (Data Cutoff)", min_value=10, max_value=max_index, value=max_index // 2)
+        
+        # --- ADAPTIVE SLIDER BOUNDS ---
+        slider_min = min(10, max_index)
+        default_val = max(slider_min, max_index // 2) 
+        
+        cutoff_idx = st.slider(
+            "Select the Current Time Point (Data Cutoff)", 
+            min_value=slider_min, 
+            max_value=max_index, 
+            value=default_val
+        )
 
         with st.spinner(f"Analyzing models and calculating RUL for index {cutoff_idx}..."):
             start_idx = max(0, cutoff_idx - window_size)
@@ -1844,7 +1837,6 @@ def main():
                     st.info("No threshold data available for this model fit.")
 
     elif app_mode == "Live Fleet Simulation":
-        # Pass active_df into the simulation
         page_live_simulation(
             active_df, user_priority_dict, outlier_factor, outlier_window,
             use_dynamic_variance, break_algo, break_window, break_step, break_sustained, 
