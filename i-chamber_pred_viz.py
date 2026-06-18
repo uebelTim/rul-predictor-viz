@@ -1448,13 +1448,13 @@ def page_synthetic_studio(base_df):
         st.markdown("<br>**Fault Profile Mix (Weights)**", unsafe_allow_html=True)
         st.caption("Adjust sliders to control how often each physical fault type is generated.")
         
-        st.markdown("** Linear Ramp** | *Gradual wear (e.g., abrasive wear, filter clogging)*")
+        st.markdown("**Linear Ramp** | *Gradual wear (e.g., abrasive wear, filter clogging)*")
         w_lin = st.slider("Linear Ramp Weight", 0, 5, 1, label_visibility="collapsed")
         
-        st.markdown("** Exponential Curve** | *Compounding damage (e.g., crack propagation, thermal runaway)*")
+        st.markdown("**Exponential Curve** | *Compounding damage (e.g., crack propagation, thermal runaway)*")
         w_exp = st.slider("Exponential Weight", 0, 5, 1, label_visibility="collapsed")
         
-        st.markdown("** Step Change** | *Sudden discrete event (e.g., snapped belt, blown seal, bumped sensor)*")
+        st.markdown("**Step Change** | *Sudden discrete event (e.g., snapped belt, blown seal, bumped sensor)*")
         w_step = st.slider("Step Change Weight", 0, 5, 1, label_visibility="collapsed")
         
     with col2:
@@ -1476,7 +1476,7 @@ def page_synthetic_studio(base_df):
         st.markdown("**Baseline Drift** | *Tests sensor aging/calibration drift (prevents false early alarms)*")
         w_drift = st.slider("Baseline Drift Weight", 0, 5, 1, label_visibility="collapsed")
         
-        st.markdown("*Tail Noise** | *Tests violent chatter near failure (challenges the outlier filter)*")
+        st.markdown("**Tail Noise** | *Tests violent chatter near failure (challenges the outlier filter)*")
         w_noise = st.slider("Tail Noise Weight", 0, 5, 1, label_visibility="collapsed")
 
     st.markdown("---")
@@ -1621,7 +1621,7 @@ def main():
 
         for c in raw_channels:
             if c.startswith("INJECT_") or c.startswith("MUTATE_"):
-                disp_name = f"🧪 {c}"
+                disp_name = f"{c}"
                 display_to_col[disp_name] = c
                 synth_options.append(disp_name)
             elif c in ['32', '73']:
