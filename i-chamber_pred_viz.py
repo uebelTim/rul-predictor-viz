@@ -1714,6 +1714,7 @@ def page_break_benchmark(active_df, is_synthetic, outlier_factor, outlier_window
     if st.button("🚀 Start Simulation", type="primary", use_container_width=True):
         st.session_state['bench_phase'] = 'init'
         st.session_state['bench_scope'] = scope
+        st.session_state['label_idx'] = 0   # <--- NEW: Initialize the pointer
 
     phase = st.session_state.get('bench_phase')
     if phase is None or st.session_state.get('bench_scope') != scope:
@@ -1755,31 +1756,31 @@ def page_break_benchmark(active_df, is_synthetic, outlier_factor, outlier_window
 
     # -----------------------------------------------------------------
     # PHASE 2: LABEL -> sequential click-to-set-break
-    # Injected channels are auto-seeded (Phase 1) and never shown here.
     # -----------------------------------------------------------------
     if phase == 'label':
         candidates = st.session_state['bench_candidates']
-
-        # Injected channels carry exact ground truth -> never label them manually.
-        def needs_manual_label(c):
-            return (c not in labels) and (not c.startswith("INJECT_"))
-
-        pending = [c for c in candidates if needs_manual_label(c)]
+        
+        # Isolate channels that actually require manual labeling
+        manual_candidates = [c for c in candidates if not c.startswith("INJECT_")]
+        
+        # Failsafe: Ensure pointer exists
+        if 'label_idx' not in st.session_state:
+            st.session_state['label_idx'] = 0
+            
+        total_manual = len(manual_candidates)
+        done_manual = st.session_state['label_idx']
 
         st.subheader("Step 2 — Label Structural Breaks")
 
-        # Make it obvious how many breaks were seeded automatically.
-        n_seeded = sum(1 for c in candidates
-                       if c.startswith("INJECT_") and c in labels)
+        n_seeded = sum(1 for c in candidates if c.startswith("INJECT_") and c in labels)
         if is_synthetic and n_seeded:
             st.caption(f"✅ Seeded {n_seeded} injected break(s) from ground truth — "
                        f"no manual labeling needed for those.")
 
-        total_manual = sum(1 for c in candidates if not c.startswith("INJECT_"))
-        done_manual = total_manual - len(pending)
-        st.progress(1 - len(pending) / max(1, total_manual) if total_manual else 1.0)
+        st.progress(done_manual / max(1, total_manual) if total_manual else 1.0)
 
-        if not pending:
+        # --- COMPLETION CHECK ---
+        if done_manual >= total_manual:
             st.success("✅ All channels labeled (seeded + manual).")
             colA, colB = st.columns(2)
             if colA.button("▶️ Run Benchmark Now", type="primary"):
@@ -1788,10 +1789,12 @@ def page_break_benchmark(active_df, is_synthetic, outlier_factor, outlier_window
             if colB.button("🔄 Re-label from scratch"):
                 st.session_state['break_labels'][scope] = {}
                 st.session_state['bench_phase'] = 'init'
+                st.session_state['label_idx'] = 0  # Reset pointer
                 st.rerun()
             return
 
-        col = pending[0]
+        # --- CURRENT CHANNEL UI ---
+        col = manual_candidates[st.session_state['label_idx']]
         st.markdown(f"**Manual label {done_manual + 1} / {total_manual}:** `{col}`")
 
         smooth, raw, time_arr = load_my_sensor_data(
@@ -1807,35 +1810,55 @@ def page_break_benchmark(active_df, is_synthetic, outlier_factor, outlier_window
         fig.add_trace(go.Scatter(x=time_np, y=np.asarray(smooth, dtype=float),
                                  mode="lines", name="smoothed",
                                  line=dict(color="blue", width=2)))
+        
+        # --- NEW: VISUAL INDICATOR ---
+        current_label = labels.get(col)
+        if current_label is not None:
+            fig.add_vline(x=current_label, line_width=2, line_dash="dash", line_color="red")
+            fig.add_annotation(x=current_label, y=np.nanmax(smooth),
+                               text="📍 Break Placed", showarrow=False,
+                               yshift=10, font=dict(color="red", size=14))
+
         fig.update_layout(template="plotly_white", height=500,
                           title=f"Click the break onset for {col}",
                           xaxis_title="Elapsed Days", yaxis_title="Sensor Value")
 
-        st.caption("👉 Click the curve where the break begins, or press "
-                   "**No obvious break** to skip (the channel becomes a control).")
+        st.caption("👉 Click the curve where the break begins. Then press **Next Channel**.")
         
-        # Missing Link Fixed: Added selection_mode="points"
-        event = st.plotly_chart(
-            fig, 
-            use_container_width=True,
-            on_select="rerun", 
-            selection_mode="points",  
-            key=f"lbl_{scope}_{col}"
-        )
+        event = st.plotly_chart(fig, use_container_width=True,
+                                on_select="rerun", selection_mode="points", key=f"lbl_{scope}_{col}")
 
+        # --- HANDLE GRAPH CLICKS ---
         pts = (event or {}).get("selection", {}).get("points", [])
-        c1, c2 = st.columns(2)
         if pts:
             break_day = float(pts[0]["x"])
-            labels[col] = break_day
-            if is_synthetic and not col.startswith("MUTATE_"):
-                propagate_break_to_mutations(col, break_day, scope, candidates)
-            st.rerun()
-        if c2.button("🚫 No obvious break (skip / control)"):
-            labels[col] = None
-            st.rerun()
-        return
+            # Prevent infinite reruns: only update if the user clicked a NEW spot
+            if labels.get(col) != break_day:
+                labels[col] = break_day
+                if is_synthetic and not col.startswith("MUTATE_"):
+                    propagate_break_to_mutations(col, break_day, scope, candidates)
+                st.rerun()
 
+        # --- NEW: MANUAL PROGRESSION CONTROLS ---
+        c1, c2, c3 = st.columns(3)
+        
+        has_label = col in labels
+        
+        if c1.button("⏭️ Next Channel", type="primary" if has_label else "secondary", disabled=not has_label):
+            st.session_state['label_idx'] += 1
+            st.rerun()
+            
+        if c2.button("🚫 No obvious break (Skip / Control)"):
+            labels[col] = None
+            st.session_state['label_idx'] += 1
+            st.rerun()
+            
+        # Optional: Let the user clear a misclick
+        if has_label and current_label is not None:
+            if c3.button("🔄 Clear Label"):
+                del labels[col]
+                st.rerun()
+        return
     # -----------------------------------------------------------------
     # PHASE 3: RUN -> score the detector against the labels
     # -----------------------------------------------------------------
