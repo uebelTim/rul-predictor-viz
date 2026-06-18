@@ -757,11 +757,9 @@ def to_horizon(rul, horizon=RUL_HORIZON):
         return float(horizon)
     return float(min(rul, horizon))
 
-
 def generate_simulation_dashboards(raw_df):
     """
-    Chart A: Status Heatmap (classification driven by RAW NaN/boolean).
-             Hover shows "Never reaches threshold (Safe)" for NaN predictions.
+    Chart A: Status Heatmap (classification driven by tolerance window & safe horizon).
     Chart B: Bias Heatmap (driven by HORIZON-CAPPED columns -> defined everywhere).
     Chart C: Scatter (full width; actual UNCAPPED, predicted CAPPED @ horizon).
     """
@@ -778,35 +776,46 @@ def generate_simulation_dashboards(raw_df):
     with col_aw:
         action_window = st.slider(
             "Action Window (Days)", min_value=5, max_value=90, value=30, step=1,
-            help="[Updates Instantly] Defines your operational horizon. Used to calculate True/False Positives."
+            help="[Updates Instantly] Tolerance window (± days). A prediction is considered a True Positive if it falls within this margin of the actual RUL."
         )
     with col_hz:
         display_horizon = st.slider(
             "Safe Horizon (Days)", min_value=30, max_value=730, value=RUL_HORIZON, step=5,
-            help="[Updates Instantly] Predictions beyond this are treated as 'Safe'. "
-                 "Post-processing only — no simulation re-run needed."
+            help="[Updates Instantly] The Safe Horizon. If both the predicted and actual RUL exceed this timeframe, it is considered a True Negative."
         )
-
 
     # -----------------------------------------------------
     # HORIZON-CAPPED COLUMNS (continuous charts B & C only).
     # NaN actual/predicted ("never reached") -> full horizon so a position exists.
     # -----------------------------------------------------
-    # Continuous charts B & C: cap to the LIVE display horizon (no re-run).
     df['Nominal_RUL_c'] = df['Nominal_RUL'].apply(lambda x: to_horizon(x, display_horizon))
     df['Actual_RUL_c']  = df['Actual_RUL'].apply(lambda x: to_horizon(x, display_horizon))
 
     # -----------------------------------------------------
-    # CHART A STATUS: stays on RAW NaN/boolean (do NOT use capped values here).
+    # CHART A STATUS: Updated Tolerance and Horizon Logic
     # -----------------------------------------------------
-    actual_safe = df['Actual_RUL'].isna() | (df['Actual_RUL'] > action_window)
-    pred_safe = df['Nominal_RUL'].isna() | (df['Nominal_RUL'] > action_window)
-
     df['Status'] = 'Unknown'
-    df.loc[actual_safe & pred_safe, 'Status'] = 'True Negative'
-    df.loc[actual_safe & ~pred_safe, 'Status'] = 'False Positive'
-    df.loc[~actual_safe & ~pred_safe, 'Status'] = 'True Positive'
-    df.loc[~actual_safe & pred_safe, 'Status'] = 'False Negative'
+
+    # Treat NaN as infinite (never reaches threshold) for logical comparisons
+    act_val = df['Actual_RUL'].fillna(np.inf)
+    pred_val = df['Nominal_RUL'].fillna(np.inf)
+
+    # 1. True Negative: Both are safely beyond the display horizon
+    is_tn = (act_val > display_horizon) & (pred_val > display_horizon)
+
+    # 2. True Positive: The prediction is within the action window tolerance of the actual RUL
+    is_tp = (abs(pred_val - act_val) <= action_window) & ~is_tn
+
+    # 3. False Positive: Predicted failure is earlier than actual (and not a TP/TN)
+    is_fp = (pred_val < act_val) & ~is_tp & ~is_tn
+
+    # 4. False Negative: Predicted failure is later than actual (and not a TP/TN)
+    is_fn = (pred_val > act_val) & ~is_tp & ~is_tn
+
+    df.loc[is_tn, 'Status'] = 'True Negative'
+    df.loc[is_tp, 'Status'] = 'True Positive'
+    df.loc[is_fp, 'Status'] = 'False Positive'
+    df.loc[is_fn, 'Status'] = 'False Negative'
 
     # -----------------------------------------------------
     # BIAS SCORE: computed from CAPPED columns -> no NaN holes in Chart B.
@@ -836,14 +845,12 @@ def generate_simulation_dashboards(raw_df):
     # ==========================================
     st.subheader("Chart A: Lifecycle Confusion Matrix (Categorical)")
     st.caption(
-        f"Each cell shows the model's classification for that day, evaluated against your "
-        f"{action_window}-day action window:  \n"
-        f"🟩 True Positive: a failure inside the window was correctly predicted.  \n"
-        f"🟧 False Positive: an alarm was raised, but no crossing occurred within the window.  \n"
-        f"⬜ True Negative: no alarm was raised and none was needed.  \n"
-        f"🟥 False Negative: an actual crossing was not predicted (the highest-risk case).  \n"
-        f"Use the time axis to identify whether a channel is over-alarming early in its life "
-        f"and stabilising later."
+        f"Each cell shows the model's classification for that day:  \n"
+        f"🟩 **True Positive:** The prediction was accurate within the ±{action_window}-day tolerance window.  \n"
+        f"⬜ **True Negative:** Both actual and predicted RUL are safely beyond the {display_horizon}-day horizon.  \n"
+        f"🟧 **False Positive:** The model alarmed too early (predicted failure earlier than actual).  \n"
+        f"🟥 **False Negative:** The model alarmed too late or missed the failure entirely (predicted failure later than actual).  \n"
+        f"Use the time axis to identify whether a channel is over-alarming early in its life and stabilising later."
     )
 
     status_map = {"True Negative": 0, "False Positive": 1, "True Positive": 2, "False Negative": 3}
@@ -908,7 +915,6 @@ def generate_simulation_dashboards(raw_df):
         yaxis=dict(type='category', autorange="reversed")
     )
     st.plotly_chart(fig_b, use_container_width=True)
-
 
     # ==========================================
     # CHART C: Aggregated Scatter (full width)
@@ -990,7 +996,7 @@ def generate_simulation_dashboards(raw_df):
         else:
             x_title = "Actual outcome (Days; safe cases grouped at right)"
 
-               # 1. Find the absolute maximum between X and Y so both axes share the same scale
+        # 1. Find the absolute maximum between X and Y so both axes share the same scale
         max_range = max(x_view_max, y_view_max)
 
         fig_c.update_layout(
@@ -1019,7 +1025,6 @@ def generate_simulation_dashboards(raw_df):
         col_left, col_center, col_right = st.columns([1, 3, 1])
         with col_center:
             st.plotly_chart(fig_c, use_container_width=False)
-
 
 
 
