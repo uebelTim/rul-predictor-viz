@@ -563,17 +563,17 @@ def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_w
 
 
 @st.cache_data
-def compute_fleet_baseline(_file_obj, outlier_factor, outlier_window):
+def compute_fleet_baseline(_base_df, outlier_factor, outlier_window):
     """
-    Computes the global fleet mean and standard deviation.
-    The underscore in _file_obj prevents Streamlit from hashing the massive file object.
+    Computes the global fleet mean and standard deviation from the ORIGINAL data.
+    The underscore prevents Streamlit from hashing the massive DataFrame.
     """
-    channels = get_available_channels(_file_obj)
+    channels = get_available_channels(_base_df)
     all_valid_data = []
     
     for ch in channels:
         sensor_smooth, _, _ = load_my_sensor_data(
-            _file_obj, col=ch, outlier_factor=outlier_factor, outlier_window=outlier_window
+            _base_df, col=ch, outlier_factor=outlier_factor, outlier_window=outlier_window
         )
         valid_vals = sensor_smooth.dropna().values
         if len(valid_vals) > 0:
@@ -1304,16 +1304,12 @@ def generate_simulation_dashboards(raw_df):
 
 
 
-def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_window,
+def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outlier_window,
                          use_dynamic_variance, break_algo, break_window, break_step, break_sustained,
                          z_factor, z_sustained, override_model, manual_model,
                          window_size, eval_window):
     st.title("Fleet-Wide Live Simulation")
     st.markdown("Run the predictive engine across all channels and all historical timesteps to generate statistical confidence metrics.")
-
-    if uploaded_file is None:
-        st.warning("Please upload a CSV file in the sidebar to begin.")
-        return
 
     st.markdown("### Simulation Setup")
     col1, col2, col3, col4 = st.columns(4)
@@ -1334,7 +1330,9 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
         st.session_state['sim_results'] = None
 
     if st.button("🚀 Start Fleet Simulation", type="primary", use_container_width=True):
-        channels = get_available_channels(uploaded_file)
+        
+        # --- REMNANT FIX 1: Fetch channels from active_df ---
+        channels = get_available_channels(active_df)
         results_list = []
 
         st.markdown("#### Simulation Progress")
@@ -1344,11 +1342,12 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
         sub_progress_bar = st.progress(0.0)
 
         total_channels = len(channels)
-        UI_THROTTLE = 5  # OPT-F: only refresh sub-status every Nth timestep
+        UI_THROTTLE = 5  
 
         if break_algo == "Fleet Z-Score":
             status_text.markdown("**Pre-computing Fleet Baseline...**")
-            fleet_mean, fleet_std = compute_fleet_baseline(uploaded_file, outlier_factor, outlier_window)
+            # --- REMNANT FIX 2: Anchor Z-Score strictly to base_df ---
+            fleet_mean, fleet_std = compute_fleet_baseline(base_df, outlier_factor, outlier_window)
         else:
             fleet_mean, fleet_std = 0.0, 1.0
             
@@ -1357,18 +1356,18 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
             sub_status_text.markdown(f"Initializing data for Channel `{channel}`...")
             sub_progress_bar.progress(0.0)
 
+            # --- REMNANT FIX 3: Load simulation data from active_df ---
             sensor_smooth, sensor_raw, time_arr = load_my_sensor_data(
-                uploaded_file, col=channel, outlier_factor=outlier_factor, outlier_window=outlier_window
+                active_df, col=channel, outlier_factor=outlier_factor, outlier_window=outlier_window
             )
 
             time_arr_np = np.asarray(time_arr, dtype=float)
             smooth_np = np.asarray(sensor_smooth, dtype=float)
-            raw_np = np.asarray(sensor_raw, dtype=float)  # OPT-F: hoist out of inner loop
+            raw_np = np.asarray(sensor_raw, dtype=float)  
 
             crossing_indices = np.where(smooth_np >= target_thresh)[0]
             actual_crossing_day = time_arr_np[crossing_indices[0]] if len(crossing_indices) > 0 else np.nan
 
-            # Detection point (marker) + look-back evaluation start.
             if break_algo == "Fleet Z-Score":
                 break_idx, _break_time, eval_start_idx = detect_zscore_break(
                     time_arr_np, smooth_np, fleet_mean, fleet_std, z_factor, z_sustained
@@ -1380,7 +1379,6 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
 
             start_idx = 50
             if req_break and break_idx is not None:
-                # Begin evaluation a bit early (run-up), but never before the 50-point floor.
                 start_idx = max(50, eval_start_idx)
             elif req_break and break_idx is None:
                 sub_status_text.markdown(f"⏭️ *Skipping Channel `{channel}` (No Structural Break detected).*")
@@ -1398,33 +1396,22 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                 progress_bar.progress((idx + 1) / total_channels)
                 continue
 
-            # OPT-D: manual O(1) running EMA state (no growing pd.Series rebuilds).
-            alpha = 2.0 / (ema_span + 1)  # span=1 -> alpha=1 -> passthrough
+            alpha = 2.0 / (ema_span + 1)  
             ema_n = ema_u = ema_l = None
-
-            # OPT-E: warm-start cache (winner params reused as next-step seed).
             warm_start_cache = None
 
-            # EMA rule:
-            #  - real value  -> update EMA normally, store smoothed value
-            #  - NaN AND EMA already running (prev not None) -> bridge EMA with RUL_HORIZON (365)
-            #    to keep the running value moving, but STORE NaN ("never reached")
-            #  - NaN AND EMA not started yet (prev is None) -> skip, store NaN
             def _ema_update(prev, new_raw):
                 if np.isnan(new_raw):
                     if prev is None:
-                        return prev, np.nan          # leading NaN: skip, store NaN
+                        return prev, np.nan          
                     bridged = alpha * float(RUL_HORIZON) + (1 - alpha) * prev
-                    return bridged, np.nan           # bridge EMA with 365, store NaN
+                    return bridged, np.nan            
                 if prev is None:
-                    return float(new_raw), float(new_raw)  # seed
+                    return float(new_raw), float(new_raw)  
                 smoothed = alpha * float(new_raw) + (1 - alpha) * prev
                 return smoothed, smoothed
 
             for step_idx, current_cutoff in enumerate(timesteps):
-                
-                # --- NEW SLICING LOGIC ---
-                # Ensure we only look back as far as the window_size allows
                 fit_start_idx = max(0, current_cutoff - window_size)
                 
                 hist_time = time_arr_np[fit_start_idx:current_cutoff]
@@ -1433,17 +1420,13 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
 
                 current_day = hist_time[-1]
 
-                # Throttle UI updates
                 if step_idx % UI_THROTTLE == 0 or step_idx == total_steps - 1:
                     sub_status_text.markdown(f"↳ Evaluating Timestep **{step_idx + 1} / {total_steps}** (Day {current_day:.1f})")
                     sub_progress_bar.progress((step_idx + 1) / total_steps)
 
-                # Cap the evaluation window to the available sliced data
                 eval_win = min(eval_window, len(hist_time))
 
-                # OPT-A + OPT-E: single competition pass; reuse winner's params for RUL.
                 if override_model:
-                    # Override is the rare case: fit ONLY the forced model (no competition).
                     best_model = manual_model
                     mse_log_str = f"{manual_model}: (override - competition skipped)"
                     raw_n, raw_u, raw_l = calculate_rul_headless(
@@ -1451,14 +1434,12 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                         use_dynamic_variance=use_dynamic_variance, precomputed_params=None
                     )
                 else:
-                    # Normal case: full competition, then REUSE the winner's fitted params.
                     top_models, all_models = evaluate_all_models(
                         hist_time, hist_smooth, priority_ranking=priority_dict,
                         eval_window=eval_win, plot=False, verbose=False,
-                        warm_start=warm_start_cache  # OPT-E
+                        warm_start=warm_start_cache  
                     )
 
-                    # Log the AIC scores instead of MSE
                     aic_log_str = "All models failed"
                     if all_models:
                         aic_log_str = " | ".join(
@@ -1473,34 +1454,31 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
                         best_model = list(top_models.keys())[0]
                         winner_params = top_models[best_model].get('params')
 
-                    # OPT-E: refresh warm-start cache with all successfully-fitted params.
                     warm_start_cache = {k: v.get('params') for k, v in all_models.items() 
                                         if v.get('params') is not None}
 
-                    # OPT-A: pass winner params -> calculate_rul_headless does NOT re-fit.
                     raw_n, raw_u, raw_l = calculate_rul_headless(
                         hist_time, hist_smooth, hist_raw, best_model, target_thresh,
                         use_dynamic_variance=use_dynamic_variance, precomputed_params=winner_params
                     )
 
-                # NaN-preserving EMA (bridges with 365 only after the EMA has started).
                 ema_n, store_n = _ema_update(ema_n, raw_n)
                 ema_u, store_u = _ema_update(ema_u, raw_u)
                 ema_l, store_l = _ema_update(ema_l, raw_l)
 
                 actual_rul = actual_crossing_day - current_day if not np.isnan(actual_crossing_day) else np.nan
                 if not np.isnan(actual_rul) and actual_rul < 0:
-                    continue  # asset already crossed -> don't log
+                    continue  
 
                 results_list.append({
                     'Channel': channel,
                     'Evaluation_Day': current_day,
                     'Model_Used': f"{best_model} (Override)" if override_model else best_model,
                     'Actual_RUL': actual_rul,
-                    'Nominal_RUL': store_n,     # NaN when model said "never reached"
+                    'Nominal_RUL': store_n,     
                     'Upper_Risk_RUL': store_u,
                     'Lower_Risk_RUL': store_l,
-                    'All_Models_AIC': aic_log_str  # <--- Updated key here
+                    'All_Models_AIC': aic_log_str  
                 })
 
             progress_bar.progress((idx + 1) / total_channels)
@@ -1694,7 +1672,7 @@ def page_synthetic_studio(base_df):
             st.success(f"✅ Generated {generated_count} synthetic channels! Toggle the Data Source in the sidebar to test them.")
 
 
-def page_break_benchmark(active_df, is_synthetic, outlier_factor, outlier_window,
+def page_break_benchmark(active_df, base_df, is_synthetic, outlier_factor, outlier_window,
                          break_algo, break_window, break_step, break_sustained,
                          z_factor, z_sustained):
     st.title("🎯 Structural Break Detection Benchmark")
@@ -1864,14 +1842,18 @@ def page_break_benchmark(active_df, is_synthetic, outlier_factor, outlier_window
     # -----------------------------------------------------------------
     # PHASE 3: RUN -> score the detector against the labels
     # -----------------------------------------------------------------
+    # -----------------------------------------------------------------
+    # PHASE 3: RUN -> score the detector against the labels
+    # -----------------------------------------------------------------
     if phase == 'run':
         st.subheader("Step 3 — Benchmark Results")
         tol = st.slider("Detection Tolerance (± Days)", 5, 90, 21, 1,
                         help="A detection within this many days of the true break counts as a hit.")
 
         if break_algo == "Fleet Z-Score":
+            # Anchor to base_df
             fleet_mean, fleet_std = compute_fleet_baseline(
-                active_df, outlier_factor, outlier_window)
+                base_df, outlier_factor, outlier_window)
 
         origin = active_df.index.min().normalize()
         origin = active_df.index.min().normalize()
@@ -2165,22 +2147,22 @@ def main():
     if app_mode == "Synthetic Data Studio":
         page_synthetic_studio(base_df)
 
-    elif app_mode == "Break Detection Benchmark":   # NEW branch
+    elif app_mode == "Break Detection Benchmark":
         page_break_benchmark(
-            active_df, is_synthetic, outlier_factor, outlier_window,
+            active_df, base_df, is_synthetic, outlier_factor, outlier_window,
             break_algo, break_window, break_step, break_sustained,
             z_factor, z_sustained
         )
 
     elif app_mode == "Deep-Dive Analysis":
-        # Load the data using the selected_col defined in the top Channel Selector
         sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(
             active_df, col=selected_col, outlier_factor=outlier_factor, outlier_window=outlier_window
         )
 
         # --- Dynamic Structural Break Router ---
         if break_algo == "Fleet Z-Score":
-            fleet_mean, fleet_std = compute_fleet_baseline(active_df, outlier_factor, outlier_window)
+            # Anchor to base_df
+            fleet_mean, fleet_std = compute_fleet_baseline(base_df, outlier_factor, outlier_window)
             break_idx, break_time, _eval_start_idx = detect_zscore_break(
                 time_arr, sensor_arr_smooth, fleet_mean, fleet_std, z_factor, z_sustained
             )
@@ -2297,7 +2279,7 @@ def main():
 
     elif app_mode == "Fleet RUL Benchmark":
         page_live_simulation(
-            active_df, user_priority_dict, outlier_factor, outlier_window,
+            active_df, base_df, user_priority_dict, outlier_factor, outlier_window,
             use_dynamic_variance, break_algo, break_window, break_step, break_sustained,
             z_factor, z_sustained, override_model, manual_model,
             window_size, eval_window
