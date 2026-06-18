@@ -1700,6 +1700,38 @@ def main():
 
     elif app_mode == "Deep-Dive Analysis":
         # Data loading now happens here, safely AFTER all sidebar parameters are set
+        raw_channels = get_available_channels(active_df)
+        
+        synth_options = []
+        base_options = []
+        display_to_col = {} # Safe dictionary mapping
+
+        for c in raw_channels:
+            if c.startswith("INJECT_") or c.startswith("MUTATE_"):
+                disp_name = f"🧪 {c}"
+                display_to_col[disp_name] = c
+                synth_options.append(disp_name)
+            elif c in ['32', '73']:
+                disp_name = f"{c} (Outlier/Deviating)"
+                display_to_col[disp_name] = c
+                base_options.append(disp_name)
+            else:
+                display_to_col[c] = c
+                base_options.append(c)
+
+        # Sort so Synthetic are ALWAYS at the top, then base options alphabetically
+        synth_options.sort()
+        base_options.sort()
+        display_options = synth_options + base_options
+
+        st.sidebar.markdown("---")
+        st.sidebar.header("🔍 Deep-Dive Settings")
+        selected_display = st.sidebar.selectbox("1. Select Data Channel", options=display_options)
+        
+        # FIX: Use the dictionary to get the exact column name! No string splitting!
+        selected_col = display_to_col[selected_display]
+
+        # Load the data using the exact, correct column name
         sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(
             active_df, col=selected_col, outlier_factor=outlier_factor, outlier_window=outlier_window
         )
