@@ -9,6 +9,8 @@ import seaborn as sns
 import streamlit as st
 from streamlit_sortables import sort_items
 from scipy.interpolate import interp1d
+import re
+
 
 # =========================================================
 # GLOBAL CONFIG
@@ -103,6 +105,94 @@ def inject_tail_noise(arr, start_idx, noise_multiplier=2.0):
         res[start_idx:] += noise
     return res
 
+# =========================================================
+# BREAK-BENCHMARK HELPERS (labels, grouping, propagation)
+# =========================================================
+
+def parse_base(col):
+    """Extracts the base channel from a synthetic column name.
+    'INJECT_Linear_1 (Base: 32)' -> '32'.  Falls back to the col itself."""
+    m = re.search(r"\(Base:\s*([^)]+)\)", str(col))
+    return m.group(1).strip() if m else str(col)
+
+
+def init_break_label_store():
+    """Ensures the dataset-scoped label store exists.
+    Value semantics per channel:
+        float  -> labeled break day (in elapsed_days space)
+        None   -> explicitly 'no obvious break' (treated as a control, not a miss)
+        absent -> not yet labeled
+    """
+    if 'break_labels' not in st.session_state:
+        st.session_state['break_labels'] = {"original": {}, "synthetic": {}}
+    return st.session_state['break_labels']
+
+
+def get_unhealthy_channels(active_df, is_synthetic, threshold,
+                           outlier_factor, outlier_window):
+    """Original dataset: a channel is unhealthy if its smoothed signal crosses
+    `threshold` anywhere. Synthetic dataset: every channel is unhealthy by
+    construction, so we return all of them."""
+    channels = get_available_channels(active_df)
+    if is_synthetic:
+        return channels
+
+    unhealthy = []
+    for ch in channels:
+        smooth, _raw, _t = load_my_sensor_data(
+            active_df, col=ch, outlier_factor=outlier_factor,
+            outlier_window=outlier_window
+        )
+        arr = np.asarray(smooth, dtype=float)
+        if arr.size and np.nanmax(arr) >= threshold:
+            unhealthy.append(ch)
+    return unhealthy
+
+
+def order_candidates_inject_first(candidates):
+    """For the synthetic set we must label the INJECT_/base channels BEFORE the
+    MUTATE_ ones, so propagation has a source break to copy. Injected/base
+    channels first, mutations last."""
+    base_like = [c for c in candidates if not c.startswith("MUTATE_")]
+    mutated   = [c for c in candidates if c.startswith("MUTATE_")]
+    return base_like + mutated
+
+
+def propagate_break_to_mutations(labeled_col, break_day, scope, candidates):
+    """When a source (INJECT_/base) channel gets a break, copy that
+    break day to every MUTATE_ channel derived from the SAME base."""
+    labels = st.session_state['break_labels'][scope]
+    base = parse_base(labeled_col)
+    
+    for c in candidates:
+        if c.startswith("MUTATE_") and parse_base(c) == base and c not in labels:
+            labels[c] = break_day
+
+def autoseed_injected_breaks(active_df, scope, candidates):
+    """Auto-fills breaks from recorded ground truth. Skips Drift (which has no timestamp)."""
+    truth = st.session_state.get('synthetic_truth', {})
+    if not truth:
+        return
+
+    labels = st.session_state['break_labels'][scope]
+    origin = active_df.index.min().normalize()
+
+    for col in candidates:
+        if col in labels:                      
+            continue
+        
+        meta = truth.get(col)
+        if not meta:
+            continue
+            
+        ts = meta.get("break_timestamp")
+        
+        # Missing Link Fixed: We no longer restrict by kind="inject".
+        # We simply check if a valid timestamp exists. This cleanly ignores Drift.
+        if pd.isna(ts):
+            continue
+            
+        labels[col] = float((ts.normalize() - origin).days)
 
 def rolling_iqr_filter(data, window=20, factor=1.5, center=True, keep_nans=True):
     """
@@ -1495,26 +1585,21 @@ def page_synthetic_studio(base_df):
     if st.button("🧬 Generate Synthetic Fleet", type="primary", use_container_width=True):
         with st.spinner("Analyzing fleet and generating synthetic profiles..."):
             channels = get_available_channels(base_df)
-            
+
             healthy_pool = []
             unhealthy_pool = []
-            
-            # PERFORMANCE FIX: Blazing fast 1-day median to ignore noise spikes instantly
+
             daily_df = base_df[channels].resample('1D').median(numeric_only=True)
-            
+
             for ch in channels:
-                # Check the clean daily max instead of raw data or heavy IQR filter
                 max_val = daily_df[ch].max(skipna=True)
-                
-                # Failsafe if channel is completely empty
                 if pd.isna(max_val):
                     continue
-                
                 if max_val < healthy_thresh:
                     healthy_pool.append(ch)
                 elif max_val >= unhealthy_thresh:
                     unhealthy_pool.append(ch)
-                    
+
             if not healthy_pool and num_healthy > 0:
                 st.error("No healthy channels found below your threshold. Cannot generate healthy synthetics.")
                 return
@@ -1522,75 +1607,328 @@ def page_synthetic_studio(base_df):
                 st.error("No unhealthy channels found above your threshold. Cannot mutate unhealthy channels.")
                 return
 
-            # ISOLATION: Create a fresh dataframe and only keep the original unhealthy channels
             synth_df = pd.DataFrame(index=base_df.index)
             for ch in unhealthy_pool:
                 synth_df[ch] = base_df[ch].copy()
 
+            ground_truth = {}     # NEW: col_name -> metadata incl. break timestamp
             generated_count = 0
 
-            # Pipeline 1: Healthy to Fault
+            # ---------- Pipeline 1: Healthy -> Fault (INJECTION) ----------
             if num_healthy > 0:
-                # --- PIPELINE UPDATE: Logarithmic ---
                 fault_types = ["Linear", "Exponential", "Logarithmic"]
                 fault_weights = [w_lin, w_exp, w_log]
-                
+
                 if sum(fault_weights) > 0:
                     for i in range(num_healthy):
                         ch = np.random.choice(healthy_pool)
                         arr = base_df[ch].values.copy()
-                        
+
                         valid_indices = np.where(~np.isnan(arr))[0]
                         if len(valid_indices) < 50:
                             continue
-                        
+
                         start_idx = valid_indices[int(len(valid_indices) * np.random.uniform(0.4, 0.8))]
                         f_type = np.random.choice(fault_types, p=np.array(fault_weights)/sum(fault_weights))
-                        
+
                         if f_type == "Linear":
                             arr = add_linear_ramp(arr, start_idx, max_offset=np.random.uniform(0.5, 1.5))
                         elif f_type == "Exponential":
                             arr = add_exponential_curve(arr, start_idx, severity_factor=np.random.uniform(0.5, 2.0))
                         elif f_type == "Logarithmic":
-                            # Target offset is a random factor between 0.5 and 10x the Healthy Threshold
                             target = np.random.uniform(0.5, 10.0) * healthy_thresh
                             arr = add_logarithmic_curve(arr, start_idx, target_offset=target)
-                            
+
                         new_col_name = f"INJECT_{f_type}_{i+1} (Base: {ch})"
                         synth_df[new_col_name] = arr
+
+                        # NEW: record exact ground-truth break as a timestamp.
+                        ground_truth[new_col_name] = {
+                            "break_timestamp": base_df.index[start_idx],
+                            "fault_type": f_type,
+                            "kind": "inject",
+                            "base": ch,
+                        }
                         generated_count += 1
 
-            # Pipeline 2: Mutating Unhealthy
+            # ---------- Pipeline 2: Mutating Unhealthy (MUTATION) ----------
             if num_unhealthy > 0:
                 mut_types = ["TimeWarp", "Drift", "Noise"]
                 mut_weights = [w_warp, w_drift, w_noise]
-                
+
                 if sum(mut_weights) > 0:
                     for j in range(num_unhealthy):
                         ch = np.random.choice(unhealthy_pool)
                         arr = base_df[ch].values.copy()
-                        
-                        # Apply a quick local median to find the true crossing in raw array index space
+
                         smooth_arr = pd.Series(arr).rolling(window=20, min_periods=1).median().values
                         crossings = np.where(smooth_arr >= unhealthy_thresh)[0]
                         start_idx = crossings[0] if len(crossings) > 0 else len(arr) // 2
-                        
+
                         m_type = np.random.choice(mut_types, p=np.array(mut_weights)/sum(mut_weights))
-                        
+
                         if m_type == "TimeWarp":
                             arr = stretch_or_squeeze_time(arr, start_idx, factor=np.random.uniform(0.5, 1.5))
                         elif m_type == "Drift":
                             arr = add_baseline_drift(arr, drift_max=np.random.uniform(0.2, 0.6))
                         elif m_type == "Noise":
                             arr = inject_tail_noise(arr, start_idx, noise_multiplier=np.random.uniform(2.0, 4.0))
-                            
+
                         new_col_name = f"MUTATE_{m_type}_{j+1} (Base: {ch})"
                         synth_df[new_col_name] = arr
+
+                        # NEW: Drift has no point break -> no usable ground truth.
+                        # Others record where the existing crossing/mutation begins.
+                        ground_truth[new_col_name] = {
+                            "break_timestamp": base_df.index[start_idx],
+                            "fault_type": m_type,
+                            "kind": "mutate",
+                            "base": ch,
+                        }
                         generated_count += 1
 
             st.session_state['synthetic_df'] = synth_df
-            st.success(f"✅ Generated {generated_count} synthetic channels in milliseconds! Toggle the Data Source in the sidebar to test them.")
-            
+            st.session_state['synthetic_truth'] = ground_truth   # NEW
+            st.success(f"✅ Generated {generated_count} synthetic channels! Toggle the Data Source in the sidebar to test them.")
+
+
+def page_break_benchmark(active_df, is_synthetic, outlier_factor, outlier_window,
+                         break_algo, break_window, break_step, break_sustained,
+                         z_factor, z_sustained):
+    st.title("🎯 Structural Break Detection Benchmark")
+    init_break_label_store()
+
+    scope = "synthetic" if is_synthetic else "original"
+    labels = st.session_state['break_labels'][scope]
+
+    st.markdown(
+        "This page scores the structural-break detectors against ground-truth break "
+        "points. Click **Start Simulation** to begin: injected synthetic channels are "
+        "auto-seeded from their recorded break times, and only channels without known "
+        "ground truth need manual labeling. The benchmark then runs automatically."
+    )
+
+    # -----------------------------------------------------------------
+    # PHASE GATE
+    # -----------------------------------------------------------------
+    if st.button("🚀 Start Simulation", type="primary", use_container_width=True):
+        st.session_state['bench_phase'] = 'init'
+        st.session_state['bench_scope'] = scope
+
+    phase = st.session_state.get('bench_phase')
+    if phase is None or st.session_state.get('bench_scope') != scope:
+        st.info("Press **Start Simulation** to begin labeling / benchmarking this dataset.")
+        if labels:
+            st.caption(f"Existing labels for **{scope}**: "
+                       f"{sum(v is not None for v in labels.values())} breaks, "
+                       f"{sum(v is None for v in labels.values())} skipped.")
+        return
+
+    # -----------------------------------------------------------------
+    # PHASE 1: INIT -> build candidate list (the original/synthetic fork)
+    # -----------------------------------------------------------------
+    if phase == 'init':
+        if is_synthetic:
+            candidates = get_unhealthy_channels(active_df, True, None,
+                                                outlier_factor, outlier_window)
+            candidates = order_candidates_inject_first(candidates)
+            autoseed_injected_breaks(active_df, scope, candidates)   # seed INJECT_ + propagate
+            st.session_state['bench_candidates'] = candidates
+            st.session_state['bench_phase'] = 'label'
+            st.rerun()
+        else:
+            st.subheader("Step 1 — Unhealthy Threshold (Original Dataset)")
+            thresh = st.number_input(
+                "A channel is 'unhealthy' if its smoothed signal crosses this value:",
+                min_value=0.01, max_value=10.0, value=0.2, step=0.05
+            )
+            if st.button("Find Unhealthy Channels ▶️"):
+                candidates = get_unhealthy_channels(active_df, False, thresh,
+                                                    outlier_factor, outlier_window)
+                if not candidates:
+                    st.warning("No channels cross that threshold. Lower it and retry.")
+                    return
+                st.session_state['bench_candidates'] = candidates
+                st.session_state['bench_phase'] = 'label'
+                st.rerun()
+        return
+
+    # -----------------------------------------------------------------
+    # PHASE 2: LABEL -> sequential click-to-set-break
+    # Injected channels are auto-seeded (Phase 1) and never shown here.
+    # -----------------------------------------------------------------
+    if phase == 'label':
+        candidates = st.session_state['bench_candidates']
+
+        # Injected channels carry exact ground truth -> never label them manually.
+        def needs_manual_label(c):
+            return (c not in labels) and (not c.startswith("INJECT_"))
+
+        pending = [c for c in candidates if needs_manual_label(c)]
+
+        st.subheader("Step 2 — Label Structural Breaks")
+
+        # Make it obvious how many breaks were seeded automatically.
+        n_seeded = sum(1 for c in candidates
+                       if c.startswith("INJECT_") and c in labels)
+        if is_synthetic and n_seeded:
+            st.caption(f"✅ Seeded {n_seeded} injected break(s) from ground truth — "
+                       f"no manual labeling needed for those.")
+
+        total_manual = sum(1 for c in candidates if not c.startswith("INJECT_"))
+        done_manual = total_manual - len(pending)
+        st.progress(1 - len(pending) / max(1, total_manual) if total_manual else 1.0)
+
+        if not pending:
+            st.success("✅ All channels labeled (seeded + manual).")
+            colA, colB = st.columns(2)
+            if colA.button("▶️ Run Benchmark Now", type="primary"):
+                st.session_state['bench_phase'] = 'run'
+                st.rerun()
+            if colB.button("🔄 Re-label from scratch"):
+                st.session_state['break_labels'][scope] = {}
+                st.session_state['bench_phase'] = 'init'
+                st.rerun()
+            return
+
+        col = pending[0]
+        st.markdown(f"**Manual label {done_manual + 1} / {total_manual}:** `{col}`")
+
+        smooth, raw, time_arr = load_my_sensor_data(
+            active_df, col=col, outlier_factor=outlier_factor,
+            outlier_window=outlier_window
+        )
+        time_np = np.asarray(time_arr, dtype=float)
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=time_np, y=np.asarray(raw, dtype=float),
+                                 mode="markers", name="raw",
+                                 marker=dict(size=4, opacity=0.4, color="gray")))
+        fig.add_trace(go.Scatter(x=time_np, y=np.asarray(smooth, dtype=float),
+                                 mode="lines", name="smoothed",
+                                 line=dict(color="blue", width=2)))
+        fig.update_layout(template="plotly_white", height=500,
+                          title=f"Click the break onset for {col}",
+                          xaxis_title="Elapsed Days", yaxis_title="Sensor Value")
+
+        st.caption("👉 Click the curve where the break begins, or press "
+                   "**No obvious break** to skip (the channel becomes a control).")
+        
+        # Missing Link Fixed: Added selection_mode="points"
+        event = st.plotly_chart(
+            fig, 
+            use_container_width=True,
+            on_select="rerun", 
+            selection_mode="points",  
+            key=f"lbl_{scope}_{col}"
+        )
+
+        pts = (event or {}).get("selection", {}).get("points", [])
+        c1, c2 = st.columns(2)
+        if pts:
+            break_day = float(pts[0]["x"])
+            labels[col] = break_day
+            if is_synthetic and not col.startswith("MUTATE_"):
+                propagate_break_to_mutations(col, break_day, scope, candidates)
+            st.rerun()
+        if c2.button("🚫 No obvious break (skip / control)"):
+            labels[col] = None
+            st.rerun()
+        return
+
+    # -----------------------------------------------------------------
+    # PHASE 3: RUN -> score the detector against the labels
+    # -----------------------------------------------------------------
+    if phase == 'run':
+        st.subheader("Step 3 — Benchmark Results")
+        tol = st.slider("Detection Tolerance (± Days)", 5, 90, 21, 1,
+                        help="A detection within this many days of the true break counts as a hit.")
+
+        if break_algo == "Fleet Z-Score":
+            fleet_mean, fleet_std = compute_fleet_baseline(
+                active_df, outlier_factor, outlier_window)
+
+        origin = active_df.index.min().normalize()
+        rows = []
+
+        for col, true_day in labels.items():
+            if col not in active_df.columns:
+                continue
+            smooth, raw, time_arr = load_my_sensor_data(
+                active_df, col=col, outlier_factor=outlier_factor,
+                outlier_window=outlier_window)
+            time_np = np.asarray(time_arr, dtype=float)
+            smooth_np = np.asarray(smooth, dtype=float)
+
+            if break_algo == "Fleet Z-Score":
+                b_idx, b_time, _ = detect_zscore_break(
+                    time_np, smooth_np, fleet_mean, fleet_std,
+                    z_factor, z_sustained)
+            else:
+                b_idx, b_time, _ = detect_structural_break(
+                    time_np, smooth_np, window=break_window,
+                    step=break_step, sustained_wins=break_sustained)
+
+            detected = b_time is not None
+            is_control = true_day is None     # 'no obvious break' / Drift
+
+            if is_control:
+                status = "False Positive" if detected else "True Negative"
+                latency = np.nan
+            elif not detected:
+                status = "Miss (FN)"
+                latency = np.nan
+            else:
+                latency = b_time - true_day
+                if abs(latency) <= tol:
+                    status = "Hit (TP)"
+                elif latency < -tol:
+                    status = "Early / False Trigger"
+                else:
+                    status = "Late Detection"
+
+            rows.append({
+                "Channel": col,
+                "True Break (Day)": round(true_day, 1) if true_day is not None else "— (control)",
+                "Detected (Day)": round(b_time, 1) if detected else None,
+                "Latency (Days)": round(latency, 1) if not np.isnan(latency) else None,
+                "Status": status,
+            })
+
+        res = pd.DataFrame(rows)
+        if res.empty:
+            st.info("No labeled channels to score.")
+            return
+
+        n_break = (res["True Break (Day)"] != "— (control)").sum()
+        tp    = (res["Status"] == "Hit (TP)").sum()
+        fn    = (res["Status"] == "Miss (FN)").sum()
+        fp    = (res["Status"] == "False Positive").sum()
+        early = (res["Status"] == "Early / False Trigger").sum()
+        med_lat = res.loc[res["Status"] == "Hit (TP)", "Latency (Days)"].median()
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Detection Recall", f"{tp / n_break:.0%}" if n_break else "—")
+        m2.metric("Median Latency", f"{med_lat:.1f} d" if pd.notna(med_lat) else "—")
+        m3.metric("False Alarms", int(fp + early))
+        m4.metric("Misses", int(fn))
+
+        hits = res[pd.to_numeric(res["Latency (Days)"], errors="coerce").notna()].copy()
+        if not hits.empty:
+            hits["Latency (Days)"] = pd.to_numeric(hits["Latency (Days)"])
+            figh = px.histogram(hits, x="Latency (Days)", nbins=30,
+                                title="Detection Latency (0 = perfect; <0 = fired early)")
+            figh.add_vline(x=0, line_dash="dash", line_color="black")
+            figh.add_vrect(x0=-tol, x1=tol, fillcolor="green", opacity=0.08, line_width=0)
+            st.plotly_chart(figh, use_container_width=True)
+
+        st.dataframe(res, use_container_width=True, hide_index=True)
+
+        if st.button("🔁 Restart (clear phase)"):
+            st.session_state['bench_phase'] = None
+            st.rerun()
+
+
  # ---------------------------------------------------------
 # 7. The Main UI Function (App Router)
 # ---------------------------------------------------------
@@ -1598,7 +1936,11 @@ def main():
     st.set_page_config(page_title="RUL Predictor", layout="wide")
 
     st.sidebar.title("🧭 Navigation")
-    app_mode = st.sidebar.radio("Select View:", ["Deep-Dive Analysis", "Live Fleet Simulation", "Synthetic Data Studio"])
+    app_mode = st.sidebar.radio(
+        "Select View:",
+        ["Deep-Dive Analysis", "Live Fleet Simulation",
+         "Synthetic Data Studio", "Break Detection Benchmark"]   # NEW page
+    )
     st.sidebar.markdown("---")
 
     st.sidebar.header("📁 Data Input")
@@ -1613,11 +1955,13 @@ def main():
     active_df = base_df
 
     # --- THE DATA SWITCHER ---
+    is_synthetic = False   # NEW: tracks whether the synthetic fleet is active
     if 'synthetic_df' in st.session_state:
         st.sidebar.markdown("### 🧬 Data Source")
         data_toggle = st.sidebar.radio("Active Dataset:", ["Original Fleet", "Synthetic Fault Fleet"])
         if data_toggle == "Synthetic Fault Fleet":
             active_df = st.session_state['synthetic_df']
+            is_synthetic = True   # NEW
 
     # =========================================================
     # CHANNEL SELECTOR (Top of Sidebar)
@@ -1628,10 +1972,10 @@ def main():
         st.sidebar.header("🎯 Channel Selector")
 
         raw_channels = get_available_channels(active_df)
-        
+
         synth_options = []
         base_options = []
-        display_to_col = {} # Safe dictionary mapping
+        display_to_col = {}  # Safe dictionary mapping
 
         for c in raw_channels:
             if c.startswith("INJECT_") or c.startswith("MUTATE_"):
@@ -1652,7 +1996,7 @@ def main():
         display_options = synth_options + base_options
 
         selected_display = st.sidebar.selectbox("Select Data Channel to Analyze", options=display_options)
-        
+
         # Safely fetch the exact column name
         selected_col = display_to_col[selected_display]
 
@@ -1685,11 +2029,11 @@ def main():
 
     st.sidebar.markdown("### Structural Break Algorithm")
     break_algo = st.sidebar.radio(
-        "Detection Method:", 
+        "Detection Method:",
         ["Exponential vs Linear", "Fleet Z-Score"],
         help="[Requires Simulation Re-run] Choose how the engine detects the onset of degradation."
     )
-    
+
     if break_algo == "Exponential vs Linear":
         break_window = st.sidebar.number_input("Evaluation Window (Days)", min_value=10, max_value=200, value=60, step=10)
         col_s, col_t = st.sidebar.columns(2)
@@ -1710,13 +2054,13 @@ def main():
     with st.sidebar.expander("Configure Router Ranking", expanded=False):
         st.caption("Drag and drop to set tie-breaker priority (Top = Highest Priority).")
         raw_sorted = sort_items(AVAILABLE_MODELS, direction='vertical')
-        
+
         # Fallback for Streamlit iframe render bug
         if not raw_sorted:
             sorted_models = AVAILABLE_MODELS
         else:
             sorted_models = raw_sorted
-            
+
         user_priority_dict = {model: rank for rank, model in enumerate(sorted_models, start=1)}
 
     max_rul = RUL_HORIZON
@@ -1726,6 +2070,13 @@ def main():
     # =========================================================
     if app_mode == "Synthetic Data Studio":
         page_synthetic_studio(base_df)
+
+    elif app_mode == "Break Detection Benchmark":   # NEW branch
+        page_break_benchmark(
+            active_df, is_synthetic, outlier_factor, outlier_window,
+            break_algo, break_window, break_step, break_sustained,
+            z_factor, z_sustained
+        )
 
     elif app_mode == "Deep-Dive Analysis":
         # Load the data using the selected_col defined in the top Channel Selector
@@ -1748,15 +2099,15 @@ def main():
         thresholds = [0.2, 0.5, 1.0]
 
         st.markdown("### Time Navigation")
-        
+
         # --- ADAPTIVE SLIDER BOUNDS ---
         slider_min = min(10, max_index)
-        default_val = max(slider_min, max_index // 2) 
-        
+        default_val = max(slider_min, max_index // 2)
+
         cutoff_idx = st.slider(
-            "Select the Current Time Point (Data Cutoff)", 
-            min_value=slider_min, 
-            max_value=max_index, 
+            "Select the Current Time Point (Data Cutoff)",
+            min_value=slider_min,
+            max_value=max_index,
             value=default_val
         )
 
@@ -1777,7 +2128,7 @@ def main():
 
             if override_model:
                 best_model_name = manual_model
-                reuse_params = None  
+                reuse_params = None
             else:
                 best_model_name = list(top_models.keys())[0]
                 reuse_params = top_models[best_model_name].get('params')
@@ -1796,28 +2147,28 @@ def main():
 
             with side_metrics_col:
                 st.markdown("### 📊 Model Router")
-                
+
                 best_aic_val = min([m.get('aic', float('inf')) for m in all_models.values()])
-                
+
                 leaderboard_data = []
                 for rank, (name, metrics) in enumerate(all_models.items(), start=1):
                     is_winner = (name == best_model_name)
-                    
+
                     model_aic = metrics.get('aic', float('inf'))
                     delta_aic = model_aic - best_aic_val if model_aic != float('inf') else float('inf')
-                    
+
                     leaderboard_data.append({
-                        "Rank": ("🏆 Override" if (is_winner and override_model) 
-                                 else "🏆 Algorithm" if is_winner 
+                        "Rank": ("🏆 Override" if (is_winner and override_model)
+                                 else "🏆 Algorithm" if is_winner
                                  else "🏆 Tied (Ranked lower)" if name in top_models.keys()
                                  else str(rank)),
                         "Model": name,
                         "AIC": f"{model_aic:.2f}" if model_aic != float('inf') else "Failed",
                         "Δ AIC": f"+{delta_aic:.2f}" if delta_aic != float('inf') else "N/A"
                     })
-                
+
                 st.dataframe(pd.DataFrame(leaderboard_data), use_container_width=True, hide_index=True)
-                
+
                 st.caption(
                     "**How the Algorithm Chooses:** \n"
                     "The engine uses the **Akaike Information Criterion (AIC)**. "
@@ -1853,10 +2204,11 @@ def main():
     elif app_mode == "Live Fleet Simulation":
         page_live_simulation(
             active_df, user_priority_dict, outlier_factor, outlier_window,
-            use_dynamic_variance, break_algo, break_window, break_step, break_sustained, 
-            z_factor, z_sustained, override_model, manual_model, 
+            use_dynamic_variance, break_algo, break_window, break_step, break_sustained,
+            z_factor, z_sustained, override_model, manual_model,
             window_size, eval_window
         )
+
 
 if __name__ == "__main__":
     main()
