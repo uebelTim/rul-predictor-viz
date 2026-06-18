@@ -169,7 +169,8 @@ def propagate_break_to_mutations(labeled_col, break_day, scope, candidates):
             labels[c] = break_day
 
 def autoseed_injected_breaks(active_df, scope, candidates):
-    """Auto-fills breaks from recorded ground truth. Skips Drift (which has no timestamp)."""
+    """Auto-fills INJECT_ channel breaks from recorded ground truth.
+    Mutations are skipped so they can inherit the user's manual base labels."""
     truth = st.session_state.get('synthetic_truth', {})
     if not truth:
         return
@@ -178,17 +179,18 @@ def autoseed_injected_breaks(active_df, scope, candidates):
     origin = active_df.index.min().normalize()
 
     for col in candidates:
-        if col in labels:                      
+        if col in labels:
             continue
-        
         meta = truth.get(col)
         if not meta:
             continue
             
+        # BUG FIX: Ensure we ONLY auto-seed injected faults. 
+        # Mutations will be handled by the propagation function.
+        if meta.get("kind") != "inject":
+            continue
+            
         ts = meta.get("break_timestamp")
-        
-        # Missing Link Fixed: We no longer restrict by kind="inject".
-        # We simply check if a valid timestamp exists. This cleanly ignores Drift.
         if pd.isna(ts):
             continue
             
@@ -1872,9 +1874,18 @@ def page_break_benchmark(active_df, is_synthetic, outlier_factor, outlier_window
                 active_df, outlier_factor, outlier_window)
 
         origin = active_df.index.min().normalize()
+        origin = active_df.index.min().normalize()
         rows = []
 
-        for col, true_day in labels.items():
+        # --- NEW: Progress Bar ---
+        status_text = st.empty()
+        progress_bar = st.progress(0.0)
+        total_labels = len(labels)
+
+        for i, (col, true_day) in enumerate(labels.items()):
+            status_text.markdown(f"**Running benchmark:** Analyzing `{col}` ({i+1}/{total_labels})")
+            progress_bar.progress((i + 1) / total_labels)
+            
             if col not in active_df.columns:
                 continue
             smooth, raw, time_arr = load_my_sensor_data(
@@ -1893,30 +1904,35 @@ def page_break_benchmark(active_df, is_synthetic, outlier_factor, outlier_window
                     step=break_step, sustained_wins=break_sustained)
 
             detected = b_time is not None
-            is_control = true_day is None     # 'no obvious break' / Drift
+            is_control = true_day is None
 
+            # --- NEW: Clearer Categorization ---
             if is_control:
-                status = "False Positive" if detected else "True Negative"
+                status = "False Positive (Fired on Control)" if detected else "True Negative (Correctly Ignored)"
                 latency = np.nan
             elif not detected:
-                status = "Miss (FN)"
+                status = "False Negative (Missed Break)"
                 latency = np.nan
             else:
                 latency = b_time - true_day
                 if abs(latency) <= tol:
-                    status = "Hit (TP)"
+                    status = "True Positive (Hit)"
                 elif latency < -tol:
-                    status = "Early / False Trigger"
+                    status = "False Positive (Fired Too Early)"
                 else:
-                    status = "Late Detection"
+                    status = "False Negative (Fired Too Late)"
 
             rows.append({
                 "Channel": col,
-                "True Break (Day)": round(true_day, 1) if true_day is not None else "— (control)",
+                "True Break (Day)": round(true_day, 1) if true_day is not None else "— (Control)",
                 "Detected (Day)": round(b_time, 1) if detected else None,
                 "Latency (Days)": round(latency, 1) if not np.isnan(latency) else None,
                 "Status": status,
             })
+
+        # Clear UI elements after loop
+        status_text.empty()
+        progress_bar.empty()
 
         res = pd.DataFrame(rows)
         if res.empty:
@@ -1936,13 +1952,44 @@ def page_break_benchmark(active_df, is_synthetic, outlier_factor, outlier_window
         m3.metric("False Alarms", int(fp + early))
         m4.metric("Misses", int(fn))
 
+        # --- NEW: Better Summary Metrics ---
+        n_break = (res["True Break (Day)"] != "— (Control)").sum()
+        tp    = (res["Status"] == "True Positive (Hit)").sum()
+        tn    = (res["Status"] == "True Negative (Correctly Ignored)").sum()
+        fn    = res["Status"].str.contains("False Negative").sum()
+        fp    = res["Status"].str.contains("False Positive").sum()
+        med_lat = res.loc[res["Status"] == "True Positive (Hit)", "Latency (Days)"].median()
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Detection Recall", f"{tp / n_break:.0%}" if n_break else "—")
+        m2.metric("Median Hit Latency", f"{med_lat:.1f} d" if pd.notna(med_lat) else "—")
+        m3.metric("False Alarms (FP)", int(fp))
+        m4.metric("Misses (FN)", int(fn))
+
+        # --- NEW: Horizontal Diverging Bar Chart ---
         hits = res[pd.to_numeric(res["Latency (Days)"], errors="coerce").notna()].copy()
         if not hits.empty:
             hits["Latency (Days)"] = pd.to_numeric(hits["Latency (Days)"])
-            figh = px.histogram(hits, x="Latency (Days)", nbins=30,
-                                title="Detection Latency (0 = perfect; <0 = fired early)")
-            figh.add_vline(x=0, line_dash="dash", line_color="black")
-            figh.add_vrect(x0=-tol, x1=tol, fillcolor="green", opacity=0.08, line_width=0)
+            hits = hits.sort_values("Latency (Days)")  # Sort for clean waterfall look
+
+            figh = px.bar(
+                hits, 
+                x="Latency (Days)", 
+                y="Channel", 
+                color="Status",
+                orientation='h',
+                title=f"Detection Latency per Channel (Green Zone = Perfect Hit $\pm${tol} Days)",
+                color_discrete_map={
+                    "True Positive (Hit)": "#4CAF50",
+                    "False Positive (Fired Too Early)": "#FF9800",
+                    "False Negative (Fired Too Late)": "#F44336"
+                }
+            )
+            figh.add_vline(x=0, line_dash="solid", line_color="black", line_width=2)
+            # Shade the tolerance window
+            figh.add_vrect(x0=-tol, x1=tol, fillcolor="green", opacity=0.1, line_width=0, layer="below")
+            
+            figh.update_layout(height=max(400, len(hits) * 25), template="plotly_white")
             st.plotly_chart(figh, use_container_width=True)
 
         st.dataframe(res, use_container_width=True, hide_index=True)
