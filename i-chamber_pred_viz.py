@@ -373,6 +373,75 @@ def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_w
     return trigger_idx, time_arr[trigger_idx], eval_start_idx
 
 
+@st.cache_data
+def compute_fleet_baseline(_file_obj, outlier_factor, outlier_window):
+    """
+    Computes the global fleet mean and standard deviation.
+    The underscore in _file_obj prevents Streamlit from hashing the massive file object.
+    """
+    channels = get_available_channels(_file_obj)
+    all_valid_data = []
+    
+    for ch in channels:
+        sensor_smooth, _, _ = load_my_sensor_data(
+            _file_obj, col=ch, outlier_factor=outlier_factor, outlier_window=outlier_window
+        )
+        valid_vals = sensor_smooth.dropna().values
+        if len(valid_vals) > 0:
+            all_valid_data.append(valid_vals)
+            
+    if not all_valid_data:
+        return 0.0, 1.0
+        
+    concat_vals = np.concatenate(all_valid_data)
+    fleet_mean = float(np.mean(concat_vals))
+    fleet_std = float(np.std(concat_vals))
+    
+    # Prevent divide-by-zero or zero-variance issues
+    if fleet_std < 1e-5:
+        fleet_std = 1.0
+        
+    return fleet_mean, fleet_std
+
+
+def detect_zscore_break(time_arr, sensor_arr, fleet_mean, fleet_std, z_factor=3.0, sustained_wins=3, eval_lookback=7):
+    """
+    Detects a structural break based on fleet-wide standard deviation.
+    """
+    time_arr = np.asarray(time_arr, dtype=float)
+    sensor_arr = np.asarray(sensor_arr, dtype=float)
+    
+    if len(sensor_arr) < sustained_wins:
+        return None, None, None
+
+    # Smooth the data slightly to avoid single-point noise spikes triggering the Z-score
+    smooth_sensor = pd.Series(sensor_arr).ewm(span=5, adjust=False, ignore_na=True).mean().values
+    
+    # Define the anomaly threshold
+    upper_threshold = fleet_mean + (z_factor * fleet_std)
+    
+    consecutive_anomalies = 0
+    trigger_idx = None
+    
+    for i, val in enumerate(smooth_sensor):
+        if pd.isna(val):
+            consecutive_anomalies = 0
+            continue
+            
+        # We assume the break trends upwards. If it can drop, use abs(val - fleet_mean)
+        if val > upper_threshold:
+            consecutive_anomalies += 1
+            if consecutive_anomalies >= sustained_wins:
+                trigger_idx = i
+                break
+        else:
+            consecutive_anomalies = 0
+            
+    if trigger_idx is None:
+        return None, None, None
+        
+    eval_start_idx = max(0, trigger_idx - eval_lookback)
+    return trigger_idx, time_arr[trigger_idx], eval_start_idx
 
 # ---------------------------------------------------------
 # 4. Dynamic/Static Variance & RUL Plotting
@@ -1030,8 +1099,8 @@ def generate_simulation_dashboards(raw_df):
 
 
 def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_window,
-                         use_dynamic_variance, break_window, break_step, break_sustained,
-                         override_model, manual_model):
+                         use_dynamic_variance, break_algo, break_window, break_step, break_sustained,
+                         z_factor, z_sustained, override_model, manual_model):
     st.title("Fleet-Wide Live Simulation")
     st.markdown("Run the predictive engine across all channels and all historical timesteps to generate statistical confidence metrics.")
 
@@ -1070,6 +1139,12 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
         total_channels = len(channels)
         UI_THROTTLE = 5  # OPT-F: only refresh sub-status every Nth timestep
 
+        if break_algo == "Fleet Z-Score":
+            status_text.markdown("**Pre-computing Fleet Baseline...**")
+            fleet_mean, fleet_std = compute_fleet_baseline(uploaded_file, outlier_factor, outlier_window)
+        else:
+            fleet_mean, fleet_std = 0.0, 1.0
+            
         for idx, channel in enumerate(channels):
             status_text.markdown(f"**Overall Fleet Progress:** Processing Channel `{channel}` ({idx + 1} / {total_channels})")
             sub_status_text.markdown(f"Initializing data for Channel `{channel}`...")
@@ -1087,9 +1162,14 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
             actual_crossing_day = time_arr_np[crossing_indices[0]] if len(crossing_indices) > 0 else np.nan
 
             # Detection point (marker) + look-back evaluation start.
-            break_idx, _break_time, eval_start_idx = detect_structural_break(
-                time_arr, sensor_smooth, window=break_window, step=break_step, sustained_wins=break_sustained
-            )
+            if break_algo == "Fleet Z-Score":
+                break_idx, _break_time, eval_start_idx = detect_zscore_break(
+                    time_arr_np, smooth_np, fleet_mean, fleet_std, z_factor, z_sustained
+                )
+            else:
+                break_idx, _break_time, eval_start_idx = detect_structural_break(
+                    time_arr_np, smooth_np, window=break_window, step=break_step, sustained_wins=break_sustained
+                )
 
             start_idx = 50
             if req_break and break_idx is not None:
@@ -1262,16 +1342,32 @@ def main():
                                        help="[Requires Simulation Re-run] Forces a specific model, ignoring the auto recommendation.")
     manual_model = st.sidebar.selectbox("Force specific model:", options=AVAILABLE_MODELS, disabled=not override_model)
 
-    st.sidebar.markdown("### Structural Break (Model Competition)")
-    break_window = st.sidebar.number_input("Evaluation Window (Days)", min_value=10, max_value=200, value=60, step=10,
-                                           help="[Requires Simulation Re-run] Chunk of days analyzed to check for a bend.")
-    col_s, col_t = st.sidebar.columns(2)
-    with col_s:
-        break_step = st.number_input("Step Size (Days)", min_value=1, max_value=30, value=7, step=1,
-                                     help="[Requires Simulation Re-run] Days between break checks.")
-    with col_t:
-        break_sustained = st.number_input("Sustained Wins", min_value=1, max_value=10, value=2, step=1,
-                                          help="[Requires Simulation Re-run] Consecutive exp-model wins before triggering.")
+    st.sidebar.markdown("### Structural Break Algorithm")
+    break_algo = st.sidebar.radio(
+        "Detection Method:", 
+        ["Exponential vs Linear", "Fleet Z-Score"],
+        help="[Requires Simulation Re-run] Choose how the engine detects the onset of degradation."
+    )
+    
+    if break_algo == "Exponential vs Linear":
+        break_window = st.sidebar.number_input("Evaluation Window (Days)", min_value=10, max_value=200, value=60, step=10)
+        col_s, col_t = st.sidebar.columns(2)
+        with col_s:
+            break_step = st.number_input("Step Size (Days)", min_value=1, max_value=30, value=7, step=1)
+        with col_t:
+            break_sustained = st.number_input("Sustained Wins", min_value=1, max_value=10, value=2, step=1)
+            
+        z_factor = None # Not used
+        z_sustained = None # Not used
+    else:
+        z_factor = st.sidebar.number_input("Z-Score Multiplier", min_value=1.0, max_value=10.0, value=3.0, step=0.5,
+                                           help="How many standard deviations above the fleet mean defines a break.")
+        z_sustained = st.sidebar.number_input("Sustained Points (Days)", min_value=1, max_value=20, value=3, step=1,
+                                              help="Consecutive days the value must stay above the Z-score limit.")
+        
+        break_window = None
+        break_step = None
+        break_sustained = None
 
     st.sidebar.markdown("### Router Priority Ranking")
     with st.sidebar.expander("Configure Router Ranking", expanded=False):
@@ -1310,10 +1406,16 @@ def main():
             uploaded_file, col=selected_col, outlier_factor=outlier_factor, outlier_window=outlier_window
         )
 
-        break_idx, break_time, _eval_start_idx = detect_structural_break(
-            time_arr, sensor_arr_smooth, window=break_window, step=break_step,
-            sustained_wins=break_sustained
-        )
+        # --- NEW ROUTER LOGIC ---
+        if break_algo == "Fleet Z-Score":
+            fleet_mean, fleet_std = compute_fleet_baseline(uploaded_file, outlier_factor, outlier_window)
+            break_idx, break_time, _eval_start_idx = detect_zscore_break(
+                time_arr, sensor_arr_smooth, fleet_mean, fleet_std, z_factor, z_sustained
+            )
+        else:
+            break_idx, break_time, _eval_start_idx = detect_structural_break(
+                time_arr, sensor_arr_smooth, window=break_window, step=break_step, sustained_wins=break_sustained
+            )
 
 
         max_index = len(time_arr) - 1
@@ -1403,7 +1505,8 @@ def main():
     elif app_mode == "Live Fleet Simulation":
         page_live_simulation(
             uploaded_file, user_priority_dict, outlier_factor, outlier_window,
-            use_dynamic_variance, break_window, break_step, break_sustained, override_model, manual_model
+            use_dynamic_variance, break_window, break_step, break_sustained, override_model, manual_model,
+            break_algo, z_factor, z_sustained
         )
 
 
