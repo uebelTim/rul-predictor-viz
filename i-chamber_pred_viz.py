@@ -1418,7 +1418,7 @@ def page_live_simulation(uploaded_file, priority_dict, outlier_factor, outlier_w
 # ---------------------------------------------------------
 # 6. Synthetic Data Studio Page
 # ---------------------------------------------------------
-def page_synthetic_studio(base_df, outlier_factor, outlier_window):
+def page_synthetic_studio(base_df):
     st.title("🧪 Synthetic Data Studio")
     
     with st.expander("📖 Guide: The Physics of Synthetic Testing", expanded=True):
@@ -1442,7 +1442,7 @@ def page_synthetic_studio(base_df, outlier_factor, outlier_window):
         )
         healthy_thresh = st.number_input(
             "Max value to be considered 'Healthy'", value=0.2, step=0.1,
-            help="Filters the fleet. Only channels whose smoothed maximum stays below this value will be used as baselines."
+            help="Filters the fleet based on 1-day median data to ignore noise."
         )
         
         st.markdown("<br>**Fault Profile Mix (Weights)**", unsafe_allow_html=True)
@@ -1464,7 +1464,7 @@ def page_synthetic_studio(base_df, outlier_factor, outlier_window):
         )
         unhealthy_thresh = st.number_input(
             "Min value to be considered 'Unhealthy'", value=0.2, step=0.1,
-            help="Filters the fleet. Only channels that eventually cross this threshold will be used as baselines."
+            help="Filters the fleet based on 1-day median data."
         )
         
         st.markdown("<br>**Mutation Mix (Weights)**", unsafe_allow_html=True)
@@ -1488,17 +1488,16 @@ def page_synthetic_studio(base_df, outlier_factor, outlier_window):
             healthy_pool = []
             unhealthy_pool = []
             
+            # PERFORMANCE FIX: Blazing fast 1-day median to ignore noise spikes instantly
+            daily_df = base_df[channels].resample('1D').median(numeric_only=True)
+            
             for ch in channels:
-                # Run the data through your actual filter so noise spikes are ignored
-                sensor_smooth, _, _ = load_my_sensor_data(
-                    base_df, col=ch, outlier_factor=outlier_factor, outlier_window=outlier_window
-                )
+                # Check the clean daily max instead of raw data or heavy IQR filter
+                max_val = daily_df[ch].max(skipna=True)
                 
-                # Skip channels that are entirely empty after cleaning
-                if len(sensor_smooth.dropna()) < 10:
+                # Failsafe if channel is completely empty
+                if pd.isna(max_val):
                     continue
-                    
-                max_val = sensor_smooth.max(skipna=True)
                 
                 if max_val < healthy_thresh:
                     healthy_pool.append(ch)
@@ -1543,7 +1542,6 @@ def page_synthetic_studio(base_df, outlier_factor, outlier_window):
                         elif f_type == "Step":
                             arr = add_step_change(arr, start_idx, offset=np.random.uniform(0.3, 0.8))
                             
-                        # NEW NAMING CONVENTION
                         new_col_name = f"INJECT_{f_type}_{i+1} (Base: {ch})"
                         synth_df[new_col_name] = arr
                         generated_count += 1
@@ -1558,7 +1556,7 @@ def page_synthetic_studio(base_df, outlier_factor, outlier_window):
                         ch = np.random.choice(unhealthy_pool)
                         arr = base_df[ch].values.copy()
                         
-                        # Apply a quick local median to find the true crossing, ignoring raw spikes
+                        # Apply a quick local median to find the true crossing in raw array index space
                         smooth_arr = pd.Series(arr).rolling(window=20, min_periods=1).median().values
                         crossings = np.where(smooth_arr >= unhealthy_thresh)[0]
                         start_idx = crossings[0] if len(crossings) > 0 else len(arr) // 2
@@ -1572,13 +1570,12 @@ def page_synthetic_studio(base_df, outlier_factor, outlier_window):
                         elif m_type == "Noise":
                             arr = inject_tail_noise(arr, start_idx, noise_multiplier=np.random.uniform(2.0, 4.0))
                             
-                        # NEW NAMING CONVENTION
                         new_col_name = f"MUTATE_{m_type}_{j+1} (Base: {ch})"
                         synth_df[new_col_name] = arr
                         generated_count += 1
 
             st.session_state['synthetic_df'] = synth_df
-            st.success(f"✅ Generated {generated_count} synthetic channels! You can now toggle the Data Source in the sidebar to test them.")
+            st.success(f"✅ Generated {generated_count} synthetic channels in milliseconds! Toggle the Data Source in the sidebar to test them.")
             
             
 # ---------------------------------------------------------
