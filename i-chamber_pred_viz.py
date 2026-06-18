@@ -1938,8 +1938,11 @@ def main():
     st.sidebar.title("🧭 Navigation")
     app_mode = st.sidebar.radio(
         "Select View:",
-        ["Deep-Dive Analysis", "Live Fleet Simulation",
-         "Synthetic Data Studio", "Break Detection Benchmark"]   # NEW page
+        ["Deep-Dive Analysis", 
+            "Synthetic Data Studio", 
+            "Break Detection Benchmark", 
+            "Fleet RUL Benchmark"   # Renamed and moved here
+        ]
     )
     st.sidebar.markdown("---")
 
@@ -2201,7 +2204,7 @@ def main():
                 else:
                     st.info("No threshold data available for this model fit.")
 
-    elif app_mode == "Live Fleet Simulation":
+    elif app_mode == "Fleet RUL Benchmark":
         page_live_simulation(
             active_df, user_priority_dict, outlier_factor, outlier_window,
             use_dynamic_variance, break_algo, break_window, break_step, break_sustained,
