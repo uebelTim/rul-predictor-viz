@@ -940,7 +940,7 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
         # --- UPDATED: Legend pushed below the chart ---
         legend=dict(
             title="System Log", 
-            orientation="h",         # Makes the legend items sit side-by-side
+            orientation="v",         # Makes the legend items sit side-by-side
             yanchor="top",           # Anchors the top of the legend box...
             y=-0.15,                 # ...to just below the x-axis
             xanchor="center",        # Anchors the center of the legend box...
