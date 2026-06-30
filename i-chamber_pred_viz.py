@@ -927,14 +927,32 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     full_title = f"<b>{main_title}</b><br>{subtitle_html}"
 
     n_thresh = len(thresholds) if thresholds is not None else 0
+    
     fig.update_layout(
-        title=full_title, xaxis_title=f"Elapsed Time ({target_time_unit})", yaxis_title="Sensor Value",
+        title=full_title, 
+        xaxis_title=f"Elapsed Time ({target_time_unit})", 
+        yaxis_title="Sensor Value",
         xaxis=dict(range=[0, final_end_time]),
         yaxis=dict(range=[y_lower_limit, y_upper_limit], hoverformat=".3f"),
-        hovermode="x unified", template="plotly_white",
-        legend=dict(title="System Log", yanchor="top", y=1, xanchor="left", x=1.02,
-                    bordercolor="LightSteelBlue", borderwidth=1),
-        margin=dict(t=120 + (n_thresh * 15)), width=1400, height=800
+        hovermode="x unified", 
+        template="plotly_white",
+        
+        # --- UPDATED: Legend pushed below the chart ---
+        legend=dict(
+            title="System Log", 
+            orientation="h",         # Makes the legend items sit side-by-side
+            yanchor="top",           # Anchors the top of the legend box...
+            y=-0.15,                 # ...to just below the x-axis
+            xanchor="center",        # Anchors the center of the legend box...
+            x=0.5,                   # ...to the middle of the chart
+            bordercolor="LightSteelBlue", 
+            borderwidth=1
+        ),
+        
+        # --- UPDATED: Added bottom margin (b=120) to prevent the legend from being cut off ---
+        margin=dict(t=120 + (n_thresh * 15), b=120), 
+        width=1400, 
+        height=800
     )
     fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(211, 211, 211, 0.4)')
     fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(211, 211, 211, 0.4)')
