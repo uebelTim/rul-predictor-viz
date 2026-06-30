@@ -825,14 +825,15 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     # --- UPDATED: Added customdata and hovertemplate to traces ---
     fig.add_trace(go.Scatter(x=time_arr_converted, y=sensor_raw_arr, mode='markers',
                              name='Max Envelope Data', marker=dict(color='gray', size=5, opacity=0.7),
-                             customdata=raw_dates,
-                             hovertemplate='<b>Date: %{customdata}</b><br>Elapsed: %{x:.1f}<br>Value: %{y:.3f}<extra></extra>'))
+                             hovertemplate='Actual Value: %{y:.3f}<extra></extra>'))
                              
+    # 2. NOMINAL FIT: Kept the Date! Since this line is continuous, it serves as our single date label.
     fig.add_trace(go.Scatter(x=time_smooth_converted, y=smooth_preds, mode='lines',
                              name=f'{model_choice} Fit', line=dict(color='blue', width=2.5), opacity=0.8,
                              customdata=smooth_dates,
-                             hovertemplate='<b>Date: %{customdata}</b><br>Elapsed: %{x:.1f}<br>Pred: %{y:.3f}<extra></extra>'))
+                             hovertemplate='<b>Date: %{customdata}</b><br>Pred: %{y:.3f}<extra></extra>'))
                              
+    # 3. CONFIDENCE FILL: Skipping hover entirely so it doesn't duplicate the band lines
     fig.add_trace(go.Scatter(x=time_smooth_converted, y=lower_env_smooth, mode='lines',
                              line=dict(width=0), showlegend=False, hoverinfo='skip'))
                              
@@ -840,21 +841,19 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     
     fig.add_trace(go.Scatter(x=time_smooth_converted, y=upper_env_smooth, mode='lines',
                              line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 0, 255, 0.15)', name=band_name,
-                             customdata=smooth_dates,
-                             hovertemplate='<b>Date: %{customdata}</b><br>Upper Band: %{y:.3f}<extra></extra>'))
+                             hoverinfo='skip')) # <-- ensure hover is skipped on the transparent fill!
                              
+    # 4. UPPER BAND: Removed date
     fig.add_trace(go.Scatter(x=time_smooth_converted, y=upper_env_smooth, mode='lines',
                              name=f'Upper Band ({risk_pct_upper:.1f}% Risk)',
                              line=dict(color='blue', width=1.5, dash='dashdot'), opacity=0.6,
-                             customdata=smooth_dates,
-                             hovertemplate='<b>Date: %{customdata}</b><br>Upper: %{y:.3f}<extra></extra>'))
+                             hovertemplate='Upper: %{y:.3f}<extra></extra>'))
                              
+    # 5. LOWER BAND: Removed date
     fig.add_trace(go.Scatter(x=time_smooth_converted, y=lower_env_smooth, mode='lines',
                              name=f'Lower Band ({risk_pct_lower:.1f}% Risk)',
                              line=dict(color='blue', width=1.5, dash='dot'), opacity=0.4,
-                             customdata=smooth_dates,
-                             hovertemplate='<b>Date: %{customdata}</b><br>Lower: %{y:.3f}<extra></extra>'))
-
+                             hovertemplate='Lower: %{y:.3f}<extra></extra>'))
     # ---------------------------------------------------------
     # ANNOTATIONS & LEGEND / TITLES
     # ---------------------------------------------------------
@@ -1347,7 +1346,7 @@ def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outl
     st.markdown("### Simulation Setup")
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        req_break = st.toggle("Require Structural Break", value=True,
+        req_break = st.toggle("Require Structural Break", value=False,
                               help="[Requires Simulation Re-run] ON: only evaluate AFTER a detected bend. OFF: evaluate from Day 50 onward.")
     with col2:
         step_days = st.number_input("Timestep Interval (Days)", min_value=1, max_value=30, value=7,
