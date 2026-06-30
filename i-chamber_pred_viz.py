@@ -952,7 +952,7 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
         # --- UPDATED: Added bottom margin (b=120) to prevent the legend from being cut off ---
         margin=dict(t=120 + (n_thresh * 15), b=120), 
         width=1400, 
-        height=800
+        height=1000
     )
     fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(211, 211, 211, 0.4)')
     fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(211, 211, 211, 0.4)')
