@@ -2064,6 +2064,10 @@ def main():
         st.info("👋 Welcome! Please upload your sensor data CSV in the sidebar to begin.")
         st.stop()
 
+    match = re.search(r'_(\d+)\.csv$', uploaded_file.name, re.IGNORECASE)
+    if match:
+        st.sidebar.success(f"📍 **Gauge Nr:** {match.group(1)}")
+        
     # Parse the CSV once
     base_df = parse_raw_csv(uploaded_file)
     active_df = base_df
