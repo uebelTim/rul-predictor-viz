@@ -808,22 +808,52 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     upper_env_smooth = smooth_preds + (dynamic_std_smooth * sigma_factor)
     lower_env_smooth = smooth_preds - (dynamic_std_smooth * sigma_factor)
 
+    # --- NEW: Extract and calculate calendar dates for hover text ---
+    if isinstance(orig_index, pd.DatetimeIndex) and len(orig_index) > 0:
+        origin_date = orig_index.min()
+        raw_dates = orig_index.strftime('%Y-%m-%d').tolist()
+        # Convert the smooth time array back to days to add to the origin date
+        days_smooth = time_smooth_converted / conversion_factor
+        smooth_dates = [(origin_date + pd.Timedelta(days=d)).strftime('%Y-%m-%d') for d in days_smooth]
+    else:
+        raw_dates = [''] * len(sensor_raw_arr)
+        smooth_dates = [''] * len(time_smooth_converted)
+    # ---------------------------------------------------------------
+
     fig = go.Figure()
+    
+    # --- UPDATED: Added customdata and hovertemplate to traces ---
     fig.add_trace(go.Scatter(x=time_arr_converted, y=sensor_raw_arr, mode='markers',
-                             name='Max Envelope Data', marker=dict(color='gray', size=5, opacity=0.7)))
+                             name='Max Envelope Data', marker=dict(color='gray', size=5, opacity=0.7),
+                             customdata=raw_dates,
+                             hovertemplate='<b>Date: %{customdata}</b><br>Elapsed: %{x:.1f}<br>Value: %{y:.3f}<extra></extra>'))
+                             
     fig.add_trace(go.Scatter(x=time_smooth_converted, y=smooth_preds, mode='lines',
-                             name=f'{model_choice} Fit', line=dict(color='blue', width=2.5), opacity=0.8))
+                             name=f'{model_choice} Fit', line=dict(color='blue', width=2.5), opacity=0.8,
+                             customdata=smooth_dates,
+                             hovertemplate='<b>Date: %{customdata}</b><br>Elapsed: %{x:.1f}<br>Pred: %{y:.3f}<extra></extra>'))
+                             
     fig.add_trace(go.Scatter(x=time_smooth_converted, y=lower_env_smooth, mode='lines',
                              line=dict(width=0), showlegend=False, hoverinfo='skip'))
+                             
     band_name = f'±{sigma_factor}σ Confidence Band' + (' (Dynamic)' if use_dynamic_variance else ' (Static)')
+    
     fig.add_trace(go.Scatter(x=time_smooth_converted, y=upper_env_smooth, mode='lines',
-                             line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 0, 255, 0.15)', name=band_name))
+                             line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 0, 255, 0.15)', name=band_name,
+                             customdata=smooth_dates,
+                             hovertemplate='<b>Date: %{customdata}</b><br>Upper Band: %{y:.3f}<extra></extra>'))
+                             
     fig.add_trace(go.Scatter(x=time_smooth_converted, y=upper_env_smooth, mode='lines',
                              name=f'Upper Band ({risk_pct_upper:.1f}% Risk)',
-                             line=dict(color='blue', width=1.5, dash='dashdot'), opacity=0.6))
+                             line=dict(color='blue', width=1.5, dash='dashdot'), opacity=0.6,
+                             customdata=smooth_dates,
+                             hovertemplate='<b>Date: %{customdata}</b><br>Upper: %{y:.3f}<extra></extra>'))
+                             
     fig.add_trace(go.Scatter(x=time_smooth_converted, y=lower_env_smooth, mode='lines',
                              name=f'Lower Band ({risk_pct_lower:.1f}% Risk)',
-                             line=dict(color='blue', width=1.5, dash='dot'), opacity=0.4))
+                             line=dict(color='blue', width=1.5, dash='dot'), opacity=0.4,
+                             customdata=smooth_dates,
+                             hovertemplate='<b>Date: %{customdata}</b><br>Lower: %{y:.3f}<extra></extra>'))
 
     # ---------------------------------------------------------
     # ANNOTATIONS & LEGEND / TITLES
@@ -1132,7 +1162,8 @@ def generate_simulation_dashboards(raw_df):
 
     pivot_pred = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Pred', aggfunc='first')
     pivot_act = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Act', aggfunc='first')
-
+    pivot_date = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Evaluation_Date', aggfunc='first')
+    
     color_map_status = {"True Positive": "#4CAF50", "False Positive": "#FFB74D",
                         "True Negative": "#E8F5E9", "False Negative": "#F44336"}
 
@@ -1155,7 +1186,8 @@ def generate_simulation_dashboards(raw_df):
     pivot_status_text = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status', aggfunc='first')
     customdata_a = np.dstack((pivot_status_text.values,
                               pivot_pred.reindex_like(pivot_status_text).values,
-                              pivot_act.reindex_like(pivot_status_text).values))
+                              pivot_act.reindex_like(pivot_status_text).values,
+                              pivot_date.reindex_like(pivot_status_text).values))
 
     colorscale_a = [[0.0, '#E8F5E9'], [0.33, '#FFB74D'], [0.66, '#4CAF50'], [1.0, '#F44336']]
 
@@ -1163,8 +1195,8 @@ def generate_simulation_dashboards(raw_df):
     fig_a.add_trace(go.Heatmap(
         z=pivot_status_code.values, x=pivot_status_code.columns, y=pivot_status_code.index,
         colorscale=colorscale_a, zmin=0, zmax=3, showscale=False, hoverongaps=False, customdata=customdata_a,
-        hovertemplate="<b>Day:</b> %{x}<br><b>Channel:</b> %{y}<br><b>Result:</b> %{customdata[0]}<br><b>Predicted:</b> %{customdata[1]}<br><b>Actual:</b> %{customdata[2]}<extra></extra>"
-    ))
+        hovertemplate="<b>Date:</b> %{customdata[3]}<br><b>Day:</b> %{x}<br><b>Channel:</b> %{y}<br><b>Result:</b> %{customdata[0]}<br><b>Predicted:</b> %{customdata[1]}<br><b>Actual:</b> %{customdata[2]}<extra></extra>"
+        ))
     for name, color in [("True Negative (Safe)", '#E8F5E9'), ("False Positive (Early Alarm)", '#FFB74D'),
                         ("True Positive (Correct Detection)", '#4CAF50'), ("False Negative (Missed Crossing)", '#F44336')]:
         fig_a.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
@@ -1194,13 +1226,14 @@ def generate_simulation_dashboards(raw_df):
     pivot_bias_text = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Bias', aggfunc='first')
     customdata_b = np.dstack((pivot_bias_text.reindex_like(pivot_bias).values,
                               pivot_pred.reindex_like(pivot_bias).values,
-                              pivot_act.reindex_like(pivot_bias).values))
+                              pivot_act.reindex_like(pivot_bias).values,
+                              pivot_date.reindex_like(pivot_bias).values))
 
     fig_b = go.Figure(data=go.Heatmap(
         z=pivot_bias.values, x=pivot_bias.columns, y=pivot_bias.index,
         colorscale=rocket_palette, zmin=0.0, zmax=1.0, showscale=True, hoverongaps=False, customdata=customdata_b,
         colorbar=dict(title="Bias Score", tickvals=[0, 0.5, 1], ticktext=["0.0 (Early)", "0.5", "1.0 (Late)"]),
-        hovertemplate="<b>Day:</b> %{x}<br><b>Channel:</b> %{y}<br><b>Bias Score:</b> %{customdata[0]}<br><b>Predicted:</b> %{customdata[1]}<br><b>Actual:</b> %{customdata[2]}<extra></extra>"
+        hovertemplate="<b>Date:</b> %{customdata[3]}<br><b>Day:</b> %{x}<br><b>Channel:</b> %{y}<br><b>Bias Score:</b> %{customdata[0]}<br><b>Predicted:</b> %{customdata[1]}<br><b>Actual:</b> %{customdata[2]}<extra></extra>"
     ))
     fig_b.update_layout(
         xaxis_title="Simulation Day", yaxis_title="Channel", height=400, template="plotly_white", margin=dict(t=30, b=30),
@@ -1351,6 +1384,8 @@ def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outl
         else:
             fleet_mean, fleet_std = 0.0, 1.0
             
+        origin_date = active_df.index.min().normalize()
+        
         for idx, channel in enumerate(channels):
             status_text.markdown(f"**Overall Fleet Progress:** Processing Channel `{channel}` ({idx + 1} / {total_channels})")
             sub_status_text.markdown(f"Initializing data for Channel `{channel}`...")
@@ -1469,10 +1504,17 @@ def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outl
                 actual_rul = actual_crossing_day - current_day if not np.isnan(actual_crossing_day) else np.nan
                 if not np.isnan(actual_rul) and actual_rul < 0:
                     continue  
+                
+                current_date_str = (origin_date + pd.Timedelta(days=current_day)).strftime('%Y-%m-%d')
 
+                actual_rul = actual_crossing_day - current_day if not np.isnan(actual_crossing_day) else np.nan
+                if not np.isnan(actual_rul) and actual_rul < 0:
+                    continue
+                
                 results_list.append({
                     'Channel': channel,
                     'Evaluation_Day': current_day,
+                    'Evaluation_Date': current_date_str,
                     'Model_Used': f"{best_model} (Override)" if override_model else best_model,
                     'Actual_RUL': actual_rul,
                     'Nominal_RUL': store_n,     
