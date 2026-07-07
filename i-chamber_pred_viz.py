@@ -2265,7 +2265,7 @@ def main():
             )
 
         max_index = len(time_arr) - 1
-        thresholds = [0.2, 0.4]
+        thresholds = [0.2, 0.3]
 
         st.markdown("### Time Navigation")
 
