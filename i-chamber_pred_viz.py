@@ -256,10 +256,9 @@ def arctan_model(t, L, k, t0, d):
 AVAILABLE_MODELS = [
     'Linear', 
     'Logarithmic', 
-    'Gompertz',
-    'Shifted Exponential', 
     'Softplus', 
-    
+    'Gompertz',
+    'Shifted Exponential',   
 ]
 
 
