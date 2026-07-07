@@ -2321,7 +2321,11 @@ def main():
                         "Model": name,
                         "AIC": f"{model_aic:.2f}" if model_aic != float('inf') else "Failed",
                         "Δ AIC": f"+{delta_aic:.2f}" if delta_aic != float('inf') else "N/A",
-                        "MSE": f"{model_mse:.3e}" if model_mse != float('inf') else "N/A",   # <-- NEW
+                        "MSE": (
+                            "N/A" if model_mse == float('inf') else 
+                            f"{model_mse:.3e} (clamped to {MIN_MSE_FLOOR})" if model_mse < MIN_MSE_FLOOR else 
+                            f"{model_mse:.3e}"
+                        ),
                     })
 
                 st.dataframe(pd.DataFrame(leaderboard_data), use_container_width=True, hide_index=True)
