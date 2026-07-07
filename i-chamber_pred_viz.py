@@ -655,7 +655,8 @@ def inject_tail_noise(arr, start_idx, noise_multiplier=2.0):
 def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thresholds=None,
                          input_time_unit="Hours", target_time_unit="Days", warm_start_params=None,
                          title_addon="", sigma_factor=1.645, save_name=None, max_rul_display=RUL_HORIZON,
-                         use_dynamic_variance=True, break_time_raw=None, precomputed_params=None):
+                         use_dynamic_variance=True, break_time_raw=None, precomputed_params=None,
+                         variance_window=20):
     """
     OPT-A: Accepts `precomputed_params` so the deep-dive page can pass the winner's
     already-fitted params from evaluate_all_models and skip a redundant curve_fit.
@@ -718,7 +719,7 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     # ---------------------------------------------------------
     # VARIANCE CALCULATION
     # ---------------------------------------------------------
-    rolling_std = residuals_series.rolling(window=20, min_periods=1).std()
+    rolling_std = residuals_series.rolling(window=variance_window, min_periods=1).std()
     rolling_std = rolling_std.bfill().fillna(0)
 
     valid_std_mask = ~np.isnan(rolling_std)
@@ -1009,7 +1010,7 @@ def load_my_sensor_data(df, col='32', outlier_factor=3.0, outlier_window=42):
 # 6. Headless Math Engine (No Plotly rendering for speed)
 # ---------------------------------------------------------
 def calculate_rul_headless(time_raw, sensor_smooth, sensor_raw, model_choice, threshold,
-                           sigma_factor=1.645, use_dynamic_variance=True, precomputed_params=None):
+                           sigma_factor=1.645, use_dynamic_variance=True, precomputed_params=None,variance_window=20):
     """
     OPT-A: When `precomputed_params` is supplied (the winner's fit from
     evaluate_all_models), this skips curve_fit entirely - no second fit.
@@ -1048,7 +1049,7 @@ def calculate_rul_headless(time_raw, sensor_smooth, sensor_raw, model_choice, th
     # --- Variance ---
     fitted_vals = func(t_fit, *params)
     residuals = y_fit - fitted_vals
-    rolling_std = pd.Series(residuals).rolling(window=20, min_periods=1).std().bfill().fillna(0).values
+    rolling_std = pd.Series(residuals).rolling(window=variance_window, min_periods=1).std().bfill().fillna(0).values
 
     if use_dynamic_variance and len(rolling_std) > 1:
         std_slope, std_intercept = np.polyfit(t_fit, rolling_std, 1)
@@ -1357,7 +1358,7 @@ def generate_simulation_dashboards(raw_df):
 def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outlier_window,
                          use_dynamic_variance, break_algo, break_window, break_step, break_sustained,
                          z_factor, z_sustained, override_model, manual_model,
-                         window_size, eval_window):
+                         window_size, eval_window,variance_window):
     st.title("Fleet-Wide Live Simulation")
     st.markdown("Run the predictive engine across all channels and all historical timesteps to generate statistical confidence metrics.")
 
@@ -1483,7 +1484,8 @@ def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outl
                     mse_log_str = f"{manual_model}: (override - competition skipped)"
                     raw_n, raw_u, raw_l = calculate_rul_headless(
                         hist_time, hist_smooth, hist_raw, best_model, target_thresh,
-                        use_dynamic_variance=use_dynamic_variance, precomputed_params=None
+                        use_dynamic_variance=use_dynamic_variance, precomputed_params=None,
+                        variance_window=variance_window
                     )
                 else:
                     top_models, all_models = evaluate_all_models(
@@ -1511,7 +1513,7 @@ def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outl
 
                     raw_n, raw_u, raw_l = calculate_rul_headless(
                         hist_time, hist_smooth, hist_raw, best_model, target_thresh,
-                        use_dynamic_variance=use_dynamic_variance, precomputed_params=winner_params
+                        use_dynamic_variance=use_dynamic_variance, precomputed_params=winner_params,variance_window=variance_window
                     )
 
                 ema_n, store_n = _ema_update(ema_n, raw_n)
@@ -2139,7 +2141,19 @@ def main():
     outlier_window = st.sidebar.number_input("Rolling Window (4h Periods)", min_value=5, max_value=200, value=42, step=1)
 
     st.sidebar.markdown("### Variance Configuration")
-    use_dynamic_variance = st.sidebar.toggle("Use Dynamic Variance (Linear Fit)", value=True)
+    use_dynamic_variance = st.sidebar.toggle(
+        "Use Dynamic Variance (Linear Fit)", 
+        value=True,
+        help="[Updates Instantly] ON: Calculates rate of Std change and projects it into the future. OFF: Uses a fixed Std from the trailing window."
+    )
+    variance_window = st.sidebar.number_input(
+        "Variance Rolling Window (Days)", 
+        min_value=2, 
+        max_value=100, 
+        value=20, 
+        step=1,
+        help="[Updates Instantly] Trailing days used to calculate the series recend std. A smaller window reacts faster to sudden chatter, while a larger window creates smoother, more stable confidence bands."
+    )
 
     st.sidebar.markdown("### Model Override")
     override_model = st.sidebar.toggle("Enable Manual Selection", value=False)
@@ -2277,7 +2291,8 @@ def main():
                 model_choice=best_model_name, thresholds=thresholds, input_time_unit="Days",
                 title_addon=f"| Channel: {selected_col} | Cutoff: {cutoff_idx}",
                 max_rul_display=max_rul, use_dynamic_variance=use_dynamic_variance,
-                break_time_raw=break_time, precomputed_params=reuse_params
+                break_time_raw=break_time, precomputed_params=reuse_params,
+                variance_window=variance_window
             )
 
             plot_col, side_metrics_col = st.columns([3, 1])
@@ -2347,7 +2362,7 @@ def main():
             active_df, base_df, user_priority_dict, outlier_factor, outlier_window,
             use_dynamic_variance, break_algo, break_window, break_step, break_sustained,
             z_factor, z_sustained, override_model, manual_model,
-            window_size, eval_window
+            window_size, eval_window,variance_window
         )
 
 
