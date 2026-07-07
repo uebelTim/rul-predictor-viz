@@ -2381,7 +2381,7 @@ def main():
             active_df, base_df, user_priority_dict, outlier_factor, outlier_window,
             use_dynamic_variance, break_algo, break_window, break_step, break_sustained,
             z_factor, z_sustained, override_model, manual_model,
-            window_size, eval_window,variance_window
+            window_size, eval_window,variance_window, min_mse_floor
         )
 
 
