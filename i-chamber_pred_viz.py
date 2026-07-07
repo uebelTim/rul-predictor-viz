@@ -2166,6 +2166,20 @@ def main():
     st.sidebar.markdown("### Model Override")
     override_model = st.sidebar.toggle("Enable Manual Selection", value=False)
     manual_model = st.sidebar.selectbox("Force specific model:", options=AVAILABLE_MODELS, disabled=not override_model)
+    
+    st.sidebar.markdown("### Router Priority Ranking")
+    with st.sidebar.expander("Configure Router Ranking", expanded=False):
+        st.caption("Drag and drop to set tie-breaker priority (Top = Highest Priority).")
+        raw_sorted = sort_items(AVAILABLE_MODELS, direction='vertical')
+
+        # Fallback for Streamlit iframe render bug
+        if not raw_sorted:
+            sorted_models = AVAILABLE_MODELS
+        else:
+            sorted_models = raw_sorted
+
+        user_priority_dict = {model: rank for rank, model in enumerate(sorted_models, start=1)}
+
         
     st.sidebar.markdown("### Structural Break Algorithm")
     break_algo = st.sidebar.radio(
@@ -2216,19 +2230,7 @@ def main():
         help="Clamps the error to this minimum value to prevent the Exponential model from overfitting to microscopic noise on flat signal lines."
     )
 
-    st.sidebar.markdown("### Router Priority Ranking")
-    with st.sidebar.expander("Configure Router Ranking", expanded=False):
-        st.caption("Drag and drop to set tie-breaker priority (Top = Highest Priority).")
-        raw_sorted = sort_items(AVAILABLE_MODELS, direction='vertical')
-
-        # Fallback for Streamlit iframe render bug
-        if not raw_sorted:
-            sorted_models = AVAILABLE_MODELS
-        else:
-            sorted_models = raw_sorted
-
-        user_priority_dict = {model: rank for rank, model in enumerate(sorted_models, start=1)}
-
+    
     max_rul = RUL_HORIZON
 
     # =========================================================
