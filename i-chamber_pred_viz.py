@@ -305,7 +305,7 @@ def build_models_config(y_min, y_max, y_range):
 # ---------------------------------------------------------
 def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=None,
                         plot=False, verbose=True, Title_addon="",
-                        save_name=None, warm_start=None, maxfev=10000):
+                        save_name=None, warm_start=None, maxfev=10000,min_mse_floor=5e-5):
     
     time_arr = np.asarray(time_data)
     sensor_arr = np.asarray(sensor_data)
@@ -359,7 +359,7 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
             
             # Tail-Weighted Pseudo-AIC Calculation
             # Added 1e-10 to prevent math domain error if MSE is exactly 0
-            aic = n * np.log(max(mse, MIN_MSE_FLOOR)) + 2 * k
+            aic = n * np.log(max(mse, min_mse_floor)) + 2 * k
 
             results[name] = {'params': params, 'mse': mse, 'aic': aic, 'func': config['func']}
             
@@ -457,7 +457,7 @@ def solve_rul_root(func, params, target_val, t_max, get_dynamic_std,
 
 
 def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_wins=2,
-                            maxfev=2000, eval_lookback=None):
+                            maxfev=2000, eval_lookback=None, min_mse_floor=5e-5):
     """
     Detects a structural break via sustained Exponential-vs-Linear model competition.
 
@@ -528,7 +528,7 @@ def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_w
                                     p0=[y_range, y_min], maxfev=maxfev)
             preds_lin = linear_model(t_norm, *popt_lin)
             mse_lin = mean_squared_error(y_win, preds_lin)
-            aic_lin = n * np.log(max(mse_lin, MIN_MSE_FLOOR)) + 2 * 2
+            aic_lin = n * np.log(max(mse_lin, min_mse_floor)) + 2 * 2
         except Exception:  # no bare except
             aic_lin = float('inf')
 
@@ -541,7 +541,7 @@ def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_w
                                     p0=p0_exp, bounds=bounds_exp, maxfev=maxfev)
             preds_exp = shifted_exponential_model(t_norm, *popt_exp)
             mse_exp = mean_squared_error(y_win, preds_exp)
-            aic_exp = n * np.log(max(mse_exp, MIN_MSE_FLOOR)) + 2 * 4
+            aic_exp = n * np.log(max(mse_exp, min_mse_floor)) + 2 * 4
         except Exception:  # no bare except
             aic_exp = float('inf')
 
@@ -1100,12 +1100,12 @@ def generate_simulation_dashboards(raw_df):
     with col_aw:
         action_window = st.slider(
             "Action Window (Days)", min_value=5, max_value=90, value=30, step=1,
-            help="[Updates Instantly] Tolerance window (± days). A prediction is considered a True Positive if it falls within this margin of the actual RUL."
+            help="Tolerance window (± days). A prediction is considered a True Positive if it falls within this margin of the actual RUL."
         )
     with col_hz:
         display_horizon = st.slider(
             "Safe Horizon (Days)", min_value=30, max_value=730, value=RUL_HORIZON, step=5,
-            help="[Updates Instantly] The Safe Horizon. If both the predicted and actual RUL exceed this timeframe, it is considered a True Negative."
+            help="The Safe Horizon. If both the predicted and actual RUL exceed this timeframe, it is considered a True Negative."
         )
     with col_mode:
         rul_mode = st.selectbox(
@@ -1115,7 +1115,7 @@ def generate_simulation_dashboards(raw_df):
                 "Conservative (Early Alarm / Upper Band)", 
                 "Optimistic (Late Alarm / Lower Band)"
             ],
-            help="[Updates Instantly] Choose which statistical confidence band to evaluate against the actual failure."
+            help="Choose which statistical confidence band to evaluate against the actual failure."
         )
 
     # Map the selected mode to the correct dataframe column
@@ -1359,7 +1359,7 @@ def generate_simulation_dashboards(raw_df):
 def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outlier_window,
                          use_dynamic_variance, break_algo, break_window, break_step, break_sustained,
                          z_factor, z_sustained, override_model, manual_model,
-                         window_size, eval_window,variance_window):
+                         window_size, eval_window,variance_window, min_mse_floor):
     st.title("Fleet-Wide Live Simulation")
     st.markdown("Run the predictive engine across all channels and all historical timesteps to generate statistical confidence metrics.")
 
@@ -1367,16 +1367,16 @@ def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outl
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         req_break = st.toggle("Require Structural Break", value=False,
-                              help="[Requires Simulation Re-run] ON: only evaluate AFTER a detected bend. OFF: evaluate from Day 50 onward.")
+                              help=" ON: only evaluate AFTER a detected bend. OFF: evaluate from Day 50 onward.")
     with col2:
         step_days = st.number_input("Timestep Interval (Days)", min_value=1, max_value=30, value=7,
-                                    help="[Requires Simulation Re-run] Days the simulation jumps between calculations.")
+                                    help=" Days the simulation jumps between calculations.")
     with col3:
         target_thresh = st.number_input("Target Threshold", min_value=0.1, max_value=5.0, value=0.2, step=0.1,
-                                        help="[Requires Simulation Re-run] The critical limit line.")
+                                        help=" The critical limit line.")
     with col4:
         ema_span = st.number_input("EMA Smoothing Span", min_value=1, max_value=20, value=1, step=1,
-                                   help="[Requires Simulation Re-run] 1 = no smoothing. 4 = moderate smoothing.")
+                                   help=" 1 = no smoothing. 4 = moderate smoothing.")
 
     if 'sim_results' not in st.session_state:
         st.session_state['sim_results'] = None
@@ -1428,7 +1428,7 @@ def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outl
                 )
             else:
                 break_idx, _break_time, eval_start_idx = detect_structural_break(
-                    time_arr_np, smooth_np, window=break_window, step=break_step, sustained_wins=break_sustained
+                    time_arr_np, smooth_np, window=break_window, step=break_step, sustained_wins=break_sustained,min_mse_floor=min_mse_floor
                 )
 
             start_idx = 50
@@ -1492,7 +1492,7 @@ def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outl
                     top_models, all_models = evaluate_all_models(
                         hist_time, hist_smooth, priority_ranking=priority_dict,
                         eval_window=eval_win, plot=False, verbose=False,
-                        warm_start=warm_start_cache  
+                        warm_start=warm_start_cache, min_mse_floor=min_mse_floor
                     )
 
                     aic_log_str = "All models failed"
@@ -1736,7 +1736,7 @@ def page_synthetic_studio(base_df):
 
 def page_break_benchmark(active_df, base_df, is_synthetic, outlier_factor, outlier_window,
                          break_algo, break_window, break_step, break_sustained,
-                         z_factor, z_sustained):
+                         z_factor, z_sustained, min_mse_floor):
     st.title("🎯 Structural Break Detection Benchmark")
     init_break_label_store()
 
@@ -1945,7 +1945,7 @@ def page_break_benchmark(active_df, base_df, is_synthetic, outlier_factor, outli
             else:
                 b_idx, b_time, _ = detect_structural_break(
                     time_np, smooth_np, window=break_window,
-                    step=break_step, sustained_wins=break_sustained)
+                    step=break_step, sustained_wins=break_sustained,min_mse_floor=min_mse_floor)
 
             detected = b_time is not None
             is_control = true_day is None
@@ -2126,15 +2126,22 @@ def main():
     # =========================================================
     st.sidebar.markdown("---")
     st.sidebar.header("🛠️ Shared Parameters")
+    
+    if app_mode in ["Fleet RUL Benchmark", "Break Detection Benchmark"]:
+        st.sidebar.warning("⚠️ **Note:** Changing these parameters requires you to click 'Start Simulation' again to see fleet-wide effects.")
+    elif app_mode == "Synthetic Data Studio":
+        st.sidebar.info("🧬 **Note:** These parameters don't apply to the generation of synthetic data.")
+    else:
+        st.sidebar.info("⚡ **Live Mode:** Adjusting these parameters will update the charts instantly.")
 
     st.sidebar.markdown("### Predictive Model Context")
     window_size = st.sidebar.number_input(
         "Window Size (Lookback Days)", min_value=10, max_value=5000, value=300, step=10,
-        help="[Requires Simulation Re-run] Trailing days used to fit the predictive curves."
+        help="Trailing days used to fit the predictive curves."
     )
     eval_window = st.sidebar.number_input(
         "AIC Evaluation Window (Last N Days)", min_value=1, max_value=window_size, value=min(50, window_size), step=1,
-        help="[Requires Simulation Re-run] Recent days used to compute the Tail-Weighted AIC. Unlike simple error (MSE), AIC penalizes complex curves to prevent overfitting. A lower score is better."
+        help=" Recent days used to compute the Tail-Weighted AIC. Unlike simple error (MSE), AIC penalizes complex curves to prevent overfitting. A lower score is better."
     )
 
     st.sidebar.markdown("### Outlier Filtering")
@@ -2145,7 +2152,7 @@ def main():
     use_dynamic_variance = st.sidebar.toggle(
         "Use Dynamic Variance (Linear Fit)", 
         value=True,
-        help="[Updates Instantly] ON: Calculates rate of Std change and projects it into the future. OFF: Uses a fixed Std from the trailing window."
+        help="ON: Calculates rate of Std change and projects it into the future. OFF: Uses a fixed Std from the trailing window."
     )
     variance_window = st.sidebar.number_input(
         "Variance Rolling Window (Days)", 
@@ -2153,56 +2160,61 @@ def main():
         max_value=100, 
         value=20, 
         step=1,
-        help="[Updates Instantly] Trailing days used to calculate the series recend std. A smaller window reacts faster to sudden chatter, while a larger window creates smoother, more stable confidence bands."
+        help="Trailing days used to calculate the series recend std. A smaller window reacts faster to sudden chatter, while a larger window creates smoother, more stable confidence bands."
     )
 
     st.sidebar.markdown("### Model Override")
     override_model = st.sidebar.toggle("Enable Manual Selection", value=False)
     manual_model = st.sidebar.selectbox("Force specific model:", options=AVAILABLE_MODELS, disabled=not override_model)
-
-    # Dynamic warning prefix based on the active page
-    if app_mode == "Fleet RUL Benchmark":
-        sim_warn = "[Requires Simulation Re-run] "
-    else:
-        sim_warn = "[Updates Instantly] "
         
     st.sidebar.markdown("### Structural Break Algorithm")
     break_algo = st.sidebar.radio(
         "Detection Method:",
         ["Exponential vs Linear", "Fleet Z-Score"],
-        help="[Requires Simulation Re-run] Choose how the engine detects the onset of degradation."
+        help=" Choose how the engine detects the onset of degradation."
     )
 
     if break_algo == "Exponential vs Linear":
         break_window = st.sidebar.number_input(
             "Evaluation Window (Days)", min_value=10, max_value=200, value=60, step=10,
-            help=f"{sim_warn} The size of the moving window used to compare models. A larger window is more stable against noise but might detect the bend slightly later."
+            help=f"The size of the moving window used to compare models. A larger window is more stable against noise but might detect the bend slightly later."
         )
         col_s, col_t = st.sidebar.columns(2)
         with col_s:
             break_step = st.number_input(
                 "Step Size (Days)", min_value=1, max_value=30, value=7, step=1,
-                help=f"{sim_warn} How many days the window slides forward each iteration. Smaller steps offer higher precision at the cost of compute time."
+                help=f"How many days the window slides forward each iteration. Smaller steps offer higher precision at the cost of compute time."
             )
         with col_t:
             break_sustained = st.number_input(
                 "Sustained Wins", min_value=1, max_value=10, value=2, step=1,
-                help=f"{sim_warn} Consecutive times the Exponential curve must beat the Linear line to confirm a true break. Prevents false alarms from sudden noise spikes."
+                help=f"Consecutive times the Exponential curve must beat the Linear line to confirm a true break. Prevents false alarms from sudden noise spikes."
             )
         z_factor = None
         z_sustained = None
     else:
         z_factor = st.sidebar.number_input(
             "Z-Score Multiplier", min_value=1.0, max_value=10.0, value=3.0, step=0.5,
-            help=f"{sim_warn} The statistical anomaly threshold. A value of 3.0 means the signal must exceed 3 standard deviations above the historical fleet baseline."
+            help=f"The statistical anomaly threshold. A value of 3.0 means the signal must exceed 3 standard deviations above the historical fleet baseline."
         )
         z_sustained = st.sidebar.number_input(
             "Sustained Points (Days)", min_value=1, max_value=20, value=3, step=1,
-            help=f"{sim_warn} Consecutive days the signal must remain above the Z-Score threshold to be classified as a confirmed structural break."
+            help=f"Consecutive days the signal must remain above the Z-Score threshold to be classified as a confirmed structural break."
         )
         break_window = None
         break_step = None
         break_sustained = None
+        
+    st.sidebar.markdown("### AIC Overfit Prevention")
+    min_mse_floor = st.sidebar.number_input(
+        "Minimum MSE Floor", 
+        min_value=1e-8, 
+        max_value=0.1, 
+        value=5e-5, 
+        step=1e-5,
+        format="%.5f",
+        help="Clamps the error to this minimum value to prevent the Exponential model from overfitting to microscopic noise on flat signal lines."
+    )
 
     st.sidebar.markdown("### Router Priority Ranking")
     with st.sidebar.expander("Configure Router Ranking", expanded=False):
@@ -2242,11 +2254,11 @@ def main():
             # Anchor to base_df
             fleet_mean, fleet_std = compute_fleet_baseline(base_df, outlier_factor, outlier_window)
             break_idx, break_time, _eval_start_idx = detect_zscore_break(
-                time_arr, sensor_arr_smooth, fleet_mean, fleet_std, z_factor, z_sustained
+                time_arr, sensor_arr_smooth, fleet_mean, fleet_std, z_factor, z_sustained, min_mse_floor=min_mse_floor
             )
         else:
             break_idx, break_time, _eval_start_idx = detect_structural_break(
-                time_arr, sensor_arr_smooth, window=break_window, step=break_step, sustained_wins=break_sustained
+                time_arr, sensor_arr_smooth, window=break_window, step=break_step, sustained_wins=break_sustained, min_mse_floor=min_mse_floor
             )
 
         max_index = len(time_arr) - 1
@@ -2273,7 +2285,7 @@ def main():
 
             top_models, all_models = evaluate_all_models(
                 sliced_time, sliced_sensor, priority_ranking=user_priority_dict,
-                eval_window=eval_window, plot=False, verbose=False
+                eval_window=eval_window, plot=False, verbose=False, min_mse_floor=min_mse_floor
             )
 
             if not top_models:
@@ -2323,7 +2335,7 @@ def main():
                         "Δ AIC": f"+{delta_aic:.2f}" if delta_aic != float('inf') else "N/A",
                         "MSE": (
                             "N/A" if model_mse == float('inf') else 
-                            f"{model_mse:.3e} (clamped to {MIN_MSE_FLOOR})" if model_mse < MIN_MSE_FLOOR else 
+                            f"{model_mse:.3e} (clamped to {min_mse_floor})" if model_mse < min_mse_floor else 
                             f"{model_mse:.3e}"
                         ),
                     })
