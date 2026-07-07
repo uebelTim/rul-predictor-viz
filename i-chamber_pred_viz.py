@@ -2295,15 +2295,17 @@ def main():
 
                     model_aic = metrics.get('aic', float('inf'))
                     delta_aic = model_aic - best_aic_val if model_aic != float('inf') else float('inf')
+                    model_mse = metrics.get('mse', float('inf'))          # <-- NEW
 
                     leaderboard_data.append({
                         "Rank": ("🏆 Override" if (is_winner and override_model)
-                                 else "🏆 Algorithm" if is_winner
-                                 else "🏆 Tied (Ranked lower)" if name in top_models.keys()
-                                 else str(rank)),
+                                else "🏆 Algorithm" if is_winner
+                                else "🏆 Tied (Ranked lower)" if name in top_models.keys()
+                                else str(rank)),
                         "Model": name,
                         "AIC": f"{model_aic:.2f}" if model_aic != float('inf') else "Failed",
-                        "Δ AIC": f"+{delta_aic:.2f}" if delta_aic != float('inf') else "N/A"
+                        "Δ AIC": f"+{delta_aic:.2f}" if delta_aic != float('inf') else "N/A",
+                        "MSE": f"{model_mse:.3e}" if model_mse != float('inf') else "N/A",   # <-- NEW
                     })
 
                 st.dataframe(pd.DataFrame(leaderboard_data), use_container_width=True, hide_index=True)
