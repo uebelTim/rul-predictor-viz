@@ -15,8 +15,8 @@ import re
 # =========================================================
 # GLOBAL CONFIG
 # =========================================================
-RUL_HORIZON = 365  # days; "Safe" (never reached) and anything beyond this saturate here.
-
+RUL_HORIZON = 180 # days; "Safe" (never reached) and anything beyond this saturate here.
+MIN_MSE_FLOOR = 5e-5
 # =========================================================
 # SYNTHETIC FAULT GENERATORS
 # =========================================================
@@ -359,7 +359,7 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
             
             # Tail-Weighted Pseudo-AIC Calculation
             # Added 1e-10 to prevent math domain error if MSE is exactly 0
-            aic = n * np.log(mse + 1e-10) + 2 * k
+            aic = n * np.log(max(mse, MIN_MSE_FLOOR)) + 2 * k
 
             results[name] = {'params': params, 'mse': mse, 'aic': aic, 'func': config['func']}
             
@@ -522,12 +522,13 @@ def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_w
         n = len(y_win)
 
         # --- Fit Linear Model ---
+        
         try:
             popt_lin, _ = curve_fit(linear_model, t_norm, y_win,
                                     p0=[y_range, y_min], maxfev=maxfev)
             preds_lin = linear_model(t_norm, *popt_lin)
             mse_lin = mean_squared_error(y_win, preds_lin)
-            aic_lin = n * np.log(mse_lin + 1e-10) + 2 * 2
+            aic_lin = n * np.log(max(mse_lin, MIN_MSE_FLOOR)) + 2 * 2
         except Exception:  # no bare except
             aic_lin = float('inf')
 
@@ -540,7 +541,7 @@ def detect_structural_break(time_arr, sensor_arr, window=60, step=7, sustained_w
                                     p0=p0_exp, bounds=bounds_exp, maxfev=maxfev)
             preds_exp = shifted_exponential_model(t_norm, *popt_exp)
             mse_exp = mean_squared_error(y_win, preds_exp)
-            aic_exp = n * np.log(mse_exp + 1e-10) + 2 * 4
+            aic_exp = n * np.log(max(mse_exp, MIN_MSE_FLOOR)) + 2 * 4
         except Exception:  # no bare except
             aic_exp = float('inf')
 
