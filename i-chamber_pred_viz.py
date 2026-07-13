@@ -252,6 +252,11 @@ def gompertz_model(t, a, b, c, d):
 def arctan_model(t, L, k, t0, d):
     return L * (np.arctan(k * (t - t0)) / np.pi + 0.5) + d
 
+def linear_sine_model(t, a, b, c, m, d):
+    # a: amplitude, b: frequency, c: phase shift
+    # m: linear slope, d: vertical offset (intercept)
+    return a * np.sin(b * t + c) + (m * t + d)
+
 # Ordered by requested default priority (Highest to Lowest)
 AVAILABLE_MODELS = [
     'Linear', 
@@ -259,6 +264,7 @@ AVAILABLE_MODELS = [
     'Softplus', 
     'Shifted Exponential',  
     'Gompertz',
+    'Trending Sine'
      
 ]
 
@@ -298,6 +304,18 @@ def build_models_config(y_min, y_max, y_range):
             'p0': [y_range * 1.1, 1.0, 0.1, y_min],
             'bounds': ([y_range * 0.8, 0.01, 1e-4, d_lo],
                        [max(2.0, y_range * 2.2), 100.0, 50.0, d_hi]),
+        },
+        'Trending Sine': {
+            'func': linear_sine_model,
+            # p0: [Amp, Freq (guess 2 periods), Phase, Slope, Offset]
+            # We guess the amplitude is small (10% of range) and the slope handles the bulk of the rise.
+            'p0': [y_range * 0.1, 2 * 2 * np.pi, 0.0, y_range, y_min],
+            'bounds': (
+                # Lower bounds: [Amp, Freq (min 1 period), Phase, Slope, Offset]
+                [1e-5, 2 * np.pi, -np.pi, -np.inf, d_lo],           
+                # Upper bounds: [Amp, Freq (max 5 periods), Phase, Slope, Offset]
+                [y_range * 2.0, 10 * np.pi, np.pi, np.inf, d_hi]   
+            ),
         },
     }
 
