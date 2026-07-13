@@ -10,6 +10,7 @@ import streamlit as st
 from streamlit_sortables import sort_items
 from scipy.interpolate import interp1d
 import re
+import concurrent.futures
 
 
 # =========================================================
@@ -261,11 +262,11 @@ def linear_sine_model(t, a, b, c, m, d):
 AVAILABLE_MODELS = [
     'Linear', 
     'Logarithmic', 
+    'Trending Sine',
     'Softplus', 
     'Shifted Exponential',  
     'Gompertz',
-    'Trending Sine'
-     
+    
 ]
 
 
@@ -318,6 +319,7 @@ def build_models_config(y_min, y_max, y_range):
             ),
         },
     }
+
 
 # ---------------------------------------------------------
 # 2. Master Fitting Function (AIC & Priority Router)
@@ -408,6 +410,147 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
                                    key=lambda item: item[1].get('aic', float('inf'))))
 
     return top_models_sorted, full_leaderboard
+
+
+
+# Put this at the top level of your script, outside any UI functions
+def process_single_channel_worker(channel, active_df, outlier_factor, outlier_window, 
+                                  target_thresh, break_algo, break_window, break_step, 
+                                  break_sustained, z_factor, z_sustained, min_mse_floor, 
+                                  req_break, step_days, window_size, eval_window, 
+                                  override_model, manual_model, use_dynamic_variance, 
+                                  variance_window, priority_dict, ema_span, origin_date,
+                                  fleet_mean=0.0, fleet_std=1.0):
+    """
+    PURE FUNCTION: No Streamlit calls allowed here. 
+    This runs entirely on a background CPU core.
+    """
+    import numpy as np
+    import pandas as pd
+    
+    # 1. Load Data
+    sensor_smooth, sensor_raw, time_arr = load_my_sensor_data(
+        active_df, col=channel, outlier_factor=outlier_factor, outlier_window=outlier_window
+    )
+    
+    time_arr_np = np.asarray(time_arr, dtype=float)
+    smooth_np = np.asarray(sensor_smooth, dtype=float)
+    raw_np = np.asarray(sensor_raw, dtype=float)  
+
+    crossing_indices = np.where(smooth_np >= target_thresh)[0]
+    actual_crossing_day = time_arr_np[crossing_indices[0]] if len(crossing_indices) > 0 else np.nan
+
+    # 2. Structural Break Detection
+    if break_algo == "Fleet Z-Score":
+        break_idx, _break_time, eval_start_idx = detect_zscore_break(
+            time_arr_np, smooth_np, fleet_mean, fleet_std, z_factor, z_sustained
+        )
+    else:
+        break_idx, _break_time, eval_start_idx = detect_structural_break(
+            time_arr_np, smooth_np, window=break_window, step=break_step, 
+            sustained_wins=break_sustained, min_mse_floor=min_mse_floor
+        )
+
+    start_idx = 50
+    if req_break and break_idx is not None:
+        start_idx = max(50, eval_start_idx)
+    elif req_break and break_idx is None:
+        return [] # Return empty list if skipping
+
+    max_idx = len(time_arr)
+    timesteps = list(range(start_idx, max_idx, step_days))
+    if len(timesteps) == 0:
+        return []
+
+    alpha = 2.0 / (ema_span + 1)  
+    ema_n = ema_u = ema_l = None
+    warm_start_cache = None
+
+    def _ema_update(prev, new_raw):
+        if np.isnan(new_raw):
+            if prev is None:
+                return prev, np.nan          
+            bridged = alpha * float(RUL_HORIZON) + (1 - alpha) * prev
+            return bridged, np.nan            
+        if prev is None:
+            return float(new_raw), float(new_raw)  
+        smoothed = alpha * float(new_raw) + (1 - alpha) * prev
+        return smoothed, smoothed
+
+    channel_results = []
+    
+    # 3. The Timestep Loop (Running silently in background)
+    for step_idx, current_cutoff in enumerate(timesteps):
+        fit_start_idx = max(0, current_cutoff - window_size)
+        
+        hist_time = time_arr_np[fit_start_idx:current_cutoff]
+        hist_smooth = smooth_np[fit_start_idx:current_cutoff]
+        hist_raw = raw_np[fit_start_idx:current_cutoff] 
+        current_day = hist_time[-1]
+
+        eval_win = min(eval_window, len(hist_time))
+
+        if override_model:
+            best_model = manual_model
+            mse_log_str = f"{manual_model}: (override - competition skipped)"
+            raw_n, raw_u, raw_l = calculate_rul_headless(
+                hist_time, hist_smooth, hist_raw, best_model, target_thresh,
+                use_dynamic_variance=use_dynamic_variance, precomputed_params=None,
+                variance_window=variance_window
+            )
+        else:
+            top_models, all_models = evaluate_all_models(
+                hist_time, hist_smooth, priority_ranking=priority_dict,
+                eval_window=eval_win, plot=False, verbose=False,
+                warm_start=warm_start_cache, min_mse_floor=min_mse_floor
+            )
+            
+            aic_log_str = "All models failed"
+            if all_models:
+                aic_log_str = " | ".join(
+                    [f"{k}: {v['aic']:.2f}" for k, v in all_models.items() 
+                     if v.get('aic', float('inf')) != float('inf')]
+                )
+
+            if not top_models:
+                best_model = "Linear"
+                winner_params = None
+            else:
+                best_model = list(top_models.keys())[0]
+                winner_params = top_models[best_model].get('params')
+
+            warm_start_cache = {k: v.get('params') for k, v in all_models.items() 
+                                if v.get('params') is not None}
+
+            raw_n, raw_u, raw_l = calculate_rul_headless(
+                hist_time, hist_smooth, hist_raw, best_model, target_thresh,
+                use_dynamic_variance=use_dynamic_variance, precomputed_params=winner_params,
+                variance_window=variance_window
+            )
+
+        ema_n, store_n = _ema_update(ema_n, raw_n)
+        ema_u, store_u = _ema_update(ema_u, raw_u)
+        ema_l, store_l = _ema_update(ema_l, raw_l)
+
+        actual_rul = actual_crossing_day - current_day if not np.isnan(actual_crossing_day) else np.nan
+        if not np.isnan(actual_rul) and actual_rul < 0:
+            continue  
+        
+        current_date_str = (origin_date + pd.Timedelta(days=current_day)).strftime('%Y-%m-%d')
+        
+        channel_results.append({
+            'Channel': channel,
+            'Evaluation_Day': current_day,
+            'Evaluation_Date': current_date_str,
+            'Model_Used': f"{best_model} (Override)" if override_model else best_model,
+            'Actual_RUL': actual_rul,
+            'Nominal_RUL': store_n,     
+            'Upper_Risk_RUL': store_u,
+            'Lower_Risk_RUL': store_l,
+            'All_Models_AIC': aic_log_str if not override_model else mse_log_str
+        })
+        
+    return channel_results
 
 
 # ---------------------------------------------------------
@@ -1424,149 +1567,48 @@ def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outl
             
         origin_date = active_df.index.min().normalize()
         
-        for idx, channel in enumerate(channels):
-            status_text.markdown(f"**Overall Fleet Progress:** Processing Channel `{channel}` ({idx + 1} / {total_channels})")
-            sub_status_text.markdown(f"Initializing data for Channel `{channel}`...")
-            sub_progress_bar.progress(0.0)
+        status_text.markdown("**Spinning up CPU cores...**")
 
-            # --- REMNANT FIX 3: Load simulation data from active_df ---
-            sensor_smooth, sensor_raw, time_arr = load_my_sensor_data(
-                active_df, col=channel, outlier_factor=outlier_factor, outlier_window=outlier_window
-            )
-
-            time_arr_np = np.asarray(time_arr, dtype=float)
-            smooth_np = np.asarray(sensor_smooth, dtype=float)
-            raw_np = np.asarray(sensor_raw, dtype=float)  
-
-            crossing_indices = np.where(smooth_np >= target_thresh)[0]
-            actual_crossing_day = time_arr_np[crossing_indices[0]] if len(crossing_indices) > 0 else np.nan
-
-            if break_algo == "Fleet Z-Score":
-                break_idx, _break_time, eval_start_idx = detect_zscore_break(
-                    time_arr_np, smooth_np, fleet_mean, fleet_std, z_factor, z_sustained
+        # --- THE MULTI-CORE DISPATCHER ---
+        # max_workers=None defaults to the number of physical cores on your machine
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            
+            # 1. Dispatch all jobs to the background cores
+            futures = []
+            for channel in channels:
+                future = executor.submit(
+                    process_single_channel_worker, 
+                    channel, active_df, outlier_factor, outlier_window, 
+                    target_thresh, break_algo, break_window, break_step, 
+                    break_sustained, z_factor, z_sustained, min_mse_floor, 
+                    req_break, step_days, window_size, eval_window, 
+                    override_model, manual_model, use_dynamic_variance, 
+                    variance_window, priority_dict, ema_span, origin_date,
+                    fleet_mean, fleet_std
                 )
-            else:
-                break_idx, _break_time, eval_start_idx = detect_structural_break(
-                    time_arr_np, smooth_np, window=break_window, step=break_step, sustained_wins=break_sustained,min_mse_floor=min_mse_floor
-                )
+                futures.append(future)
 
-            start_idx = 50
-            if req_break and break_idx is not None:
-                start_idx = max(50, eval_start_idx)
-            elif req_break and break_idx is None:
-                sub_status_text.markdown(f"⏭️ *Skipping Channel `{channel}` (No Structural Break detected).*")
-                sub_progress_bar.progress(1.0)
-                progress_bar.progress((idx + 1) / total_channels)
-                continue
-
-            max_idx = len(time_arr)
-            timesteps = list(range(start_idx, max_idx, step_days))
-            total_steps = len(timesteps)
-
-            if total_steps == 0:
-                sub_status_text.markdown(f"⏭️ *Skipping Channel `{channel}` (Not enough historical data).*")
-                sub_progress_bar.progress(1.0)
-                progress_bar.progress((idx + 1) / total_channels)
-                continue
-
-            alpha = 2.0 / (ema_span + 1)  
-            ema_n = ema_u = ema_l = None
-            warm_start_cache = None
-
-            def _ema_update(prev, new_raw):
-                if np.isnan(new_raw):
-                    if prev is None:
-                        return prev, np.nan          
-                    bridged = alpha * float(RUL_HORIZON) + (1 - alpha) * prev
-                    return bridged, np.nan            
-                if prev is None:
-                    return float(new_raw), float(new_raw)  
-                smoothed = alpha * float(new_raw) + (1 - alpha) * prev
-                return smoothed, smoothed
-
-            for step_idx, current_cutoff in enumerate(timesteps):
-                fit_start_idx = max(0, current_cutoff - window_size)
+            # 2. Collect results as they finish and update the UI
+            channels_completed = 0
+            for future in concurrent.futures.as_completed(futures):
+                channels_completed += 1
                 
-                hist_time = time_arr_np[fit_start_idx:current_cutoff]
-                hist_smooth = smooth_np[fit_start_idx:current_cutoff]
-                hist_raw = raw_np[fit_start_idx:current_cutoff] 
-
-                current_day = hist_time[-1]
-
-                if step_idx % UI_THROTTLE == 0 or step_idx == total_steps - 1:
-                    sub_status_text.markdown(f"↳ Evaluating Timestep **{step_idx + 1} / {total_steps}** (Day {current_day:.1f})")
-                    sub_progress_bar.progress((step_idx + 1) / total_steps)
-
-                eval_win = min(eval_window, len(hist_time))
-
-                if override_model:
-                    best_model = manual_model
-                    mse_log_str = f"{manual_model}: (override - competition skipped)"
-                    raw_n, raw_u, raw_l = calculate_rul_headless(
-                        hist_time, hist_smooth, hist_raw, best_model, target_thresh,
-                        use_dynamic_variance=use_dynamic_variance, precomputed_params=None,
-                        variance_window=variance_window
-                    )
-                else:
-                    top_models, all_models = evaluate_all_models(
-                        hist_time, hist_smooth, priority_ranking=priority_dict,
-                        eval_window=eval_win, plot=False, verbose=False,
-                        warm_start=warm_start_cache, min_mse_floor=min_mse_floor
-                    )
-
-                    aic_log_str = "All models failed"
-                    if all_models:
-                        aic_log_str = " | ".join(
-                            [f"{k}: {v['aic']:.2f}" for k, v in all_models.items() 
-                             if v.get('aic', float('inf')) != float('inf')]
-                        )
-
-                    if not top_models:
-                        best_model = "Linear"
-                        winner_params = None
-                    else:
-                        best_model = list(top_models.keys())[0]
-                        winner_params = top_models[best_model].get('params')
-
-                    warm_start_cache = {k: v.get('params') for k, v in all_models.items() 
-                                        if v.get('params') is not None}
-
-                    raw_n, raw_u, raw_l = calculate_rul_headless(
-                        hist_time, hist_smooth, hist_raw, best_model, target_thresh,
-                        use_dynamic_variance=use_dynamic_variance, precomputed_params=winner_params,variance_window=variance_window
-                    )
-
-                ema_n, store_n = _ema_update(ema_n, raw_n)
-                ema_u, store_u = _ema_update(ema_u, raw_u)
-                ema_l, store_l = _ema_update(ema_l, raw_l)
-
-                actual_rul = actual_crossing_day - current_day if not np.isnan(actual_crossing_day) else np.nan
-                if not np.isnan(actual_rul) and actual_rul < 0:
-                    continue  
-                
-                current_date_str = (origin_date + pd.Timedelta(days=current_day)).strftime('%Y-%m-%d')
-
-                actual_rul = actual_crossing_day - current_day if not np.isnan(actual_crossing_day) else np.nan
-                if not np.isnan(actual_rul) and actual_rul < 0:
-                    continue
-                
-                results_list.append({
-                    'Channel': channel,
-                    'Evaluation_Day': current_day,
-                    'Evaluation_Date': current_date_str,
-                    'Model_Used': f"{best_model} (Override)" if override_model else best_model,
-                    'Actual_RUL': actual_rul,
-                    'Nominal_RUL': store_n,     
-                    'Upper_Risk_RUL': store_u,
-                    'Lower_Risk_RUL': store_l,
-                    'All_Models_AIC': aic_log_str  
-                })
-
-            progress_bar.progress((idx + 1) / total_channels)
+                try:
+                    # Get the list of results for this specific channel
+                    channel_results = future.result() 
+                    if channel_results:
+                        results_list.extend(channel_results)
+                        
+                    # Update UI in the safe Main Thread
+                    progress_bar.progress(channels_completed / total_channels)
+                    status_text.markdown(f"**Overall Fleet Progress:** {channels_completed} / {total_channels} channels complete.")
+                    
+                except Exception as e:
+                    # If a worker crashes, catch it so the whole app doesn't die
+                    st.error(f"Worker process failed on a channel: {e}")
 
         status_text.success("✅ Fleet Simulation Complete!")
-        sub_status_text.empty()
-        sub_progress_bar.empty()
+        progress_bar.empty()
 
         if results_list:
             st.session_state['sim_results'] = pd.DataFrame(results_list)
