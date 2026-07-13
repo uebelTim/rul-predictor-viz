@@ -1570,8 +1570,10 @@ def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outl
         
         available_cores = os.cpu_count() or 1
         
-        # 2. Print it to the dashboard for the user
-        st.info(f"⚡Multi-Core processing active. Utilizing **{available_cores} CPU cores**. ")
+        core_info_box = st.empty()
+        
+        # 2. Write the message INSIDE the placeholder
+        core_info_box.info(f"⚡Multi-Core processing active. Utilizing **{available_cores} CPU cores**.")
 
         status_text.markdown(f"**Spinning up {available_cores} CPU cores...**")
 
@@ -1615,6 +1617,7 @@ def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outl
 
         status_text.success("✅ Fleet Simulation Complete!")
         progress_bar.empty()
+        core_info_box.empty()
 
         if results_list:
             st.session_state['sim_results'] = pd.DataFrame(results_list)
