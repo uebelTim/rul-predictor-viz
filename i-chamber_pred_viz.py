@@ -10,6 +10,7 @@ import streamlit as st
 from streamlit_sortables import sort_items
 from scipy.interpolate import interp1d
 import re
+import os
 import concurrent.futures
 
 
@@ -1567,7 +1568,12 @@ def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outl
             
         origin_date = active_df.index.min().normalize()
         
-        status_text.markdown("**Spinning up CPU cores...**")
+        available_cores = os.cpu_count() or 1
+        
+        # 2. Print it to the dashboard for the user
+        st.info(f"⚡Multi-Core processing active. Utilizing **{available_cores} CPU cores**. ")
+
+        status_text.markdown(f"**Spinning up {available_cores} CPU cores...**")
 
         # --- THE MULTI-CORE DISPATCHER ---
         # max_workers=None defaults to the number of physical cores on your machine
