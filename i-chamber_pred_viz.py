@@ -266,60 +266,152 @@ AVAILABLE_MODELS = [
     'Trending Sine',
     'Softplus', 
     'Shifted Exponential',  
-    'Gompertz',
+    #'Gompertz',
     
 ]
 
+# ---------------------------------------------------------
+# 1a. Analytical Jacobians (Exact Partial Derivatives)
+# ---------------------------------------------------------
+def linear_jac(t, m, c):
+    """Jacobian for linear_model: [dm, dc]"""
+    dm = t
+    dc = np.ones_like(t)
+    return np.column_stack((dm, dc))
+
+def logarithmic_jac(t, a, b, d):
+    """Jacobian for logarithmic_model: [da, db, dd]"""
+    u = np.clip(b * t, 0, np.inf)
+    da = np.log1p(u)
+    
+    # Derivative wrt b is (a * t) / (1 + b*t). 
+    # If b*t was clipped to 0, the derivative is mathematically 0.
+    db = (a * t) / (1 + u)
+    db[b * t < 0] = 0.0 
+    
+    dd = np.ones_like(t)
+    return np.column_stack((da, db, dd))
+
+def shifted_exponential_jac(t, a, b, t0, d):
+    """Jacobian for shifted_exponential_model: [da, db, dt0, dd]"""
+    u = np.clip(b * (t - t0), -50, 50)
+    exp_u = np.exp(u)
+    
+    da = exp_u
+    db = a * (t - t0) * exp_u
+    dt0 = -a * b * exp_u
+    
+    # If clipped, the function is flat, so derivatives wrt b and t0 are 0
+    clip_mask = (b * (t - t0) <= -50) | (b * (t - t0) >= 50)
+    db[clip_mask] = 0.0
+    dt0[clip_mask] = 0.0
+    
+    dd = np.ones_like(t)
+    return np.column_stack((da, db, dt0, dd))
+
+def softplus_jac(t, a, b, t0, d):
+    """Jacobian for softplus_model: [da, db, dt0, dd]"""
+    x = b * (t - t0)
+    da = np.logaddexp(0, x)
+    
+    # The derivative of softplus is the sigmoid function. 
+    # We use a numerically stable sigmoid implementation:
+    sigmoid = np.where(x >= 0, 
+                       1.0 / (1.0 + np.exp(-x)), 
+                       np.exp(x) / (1.0 + np.exp(x)))
+    
+    db = a * (t - t0) * sigmoid
+    dt0 = -a * b * sigmoid
+    dd = np.ones_like(t)
+    return np.column_stack((da, db, dt0, dd))
+
+def gompertz_jac(t, a, b, c, d):
+    """Jacobian for gompertz_model: [da, db, dc, dd]"""
+    u = np.exp(-c * t)
+    E = np.exp(-b * u)
+    
+    da = E
+    db = -a * u * E
+    dc = a * b * t * u * E
+    dd = np.ones_like(t)
+    
+    return np.column_stack((da, db, dc, dd))
+
+def sine_jac(t, a, b, c, d):
+    """Jacobian for sine_model: [da, db, dc, dd]"""
+    # Assuming you added the Sine model based on our previous discussion
+    phase = b * t + c
+    sin_p = np.sin(phase)
+    cos_p = np.cos(phase)
+    
+    da = sin_p
+    db = a * t * cos_p
+    dc = a * cos_p
+    dd = np.ones_like(t)
+    return np.column_stack((da, db, dc, dd))
+
+def linear_sine_jac(t, a, b, c, m, d):
+    """Jacobian for linear_sine_model (Trending Sine): [da, db, dc, dm, dd]"""
+    phase = b * t + c
+    cos_p = np.cos(phase)
+    
+    da = np.sin(phase)
+    db = a * t * cos_p
+    dc = a * cos_p
+    dm = t
+    dd = np.ones_like(t)
+    return np.column_stack((da, db, dc, dm, dd))
 
 # ---------------------------------------------------------
 # 1b. CENTRALIZED MODEL CONFIG (single source of truth)
 # ---------------------------------------------------------
 def build_models_config(y_min, y_max, y_range):
     d_lo = y_min - 0.2
-    d_hi = y_max + 0.2  # use y_max consistently as the upper bound for offset d
+    d_hi = y_max + 0.2  
     return {
         'Linear': {
             'func': linear_model,
+            'jac': linear_jac,          # <--- ADDED
             'p0': [y_range, y_min],
             'bounds': ([-np.inf, d_lo], [np.inf, d_hi]),
         },
         'Logarithmic': {
             'func': logarithmic_model,
+            'jac': logarithmic_jac,     # <--- ADDED
             'p0': [y_range * 0.5, 10.0, y_min],
             'bounds': ([1e-5, 1e-5, d_lo], 
                        [y_range * 10.0, 500.0, d_hi]),
         },
         'Shifted Exponential': {
             'func': shifted_exponential_model,
+            'jac': shifted_exponential_jac, # <--- ADDED
             'p0': [y_range * 0.1, 5.0, 0.5, y_min],
             'bounds': ([1e-5, 0.01, 0.0, d_lo],
                        [y_range * 5.0, 50.0, 1.0, d_hi]),
         },
         'Softplus': {
             'func': softplus_model,
+            'jac': softplus_jac,        # <--- ADDED
             'p0': [y_range * 0.5, 10.0, 0.5, y_min],
             'bounds': ([1e-3, 1e-3, 0.0, d_lo],
                        [y_range * 10.0, 500.0, 1.0, d_hi]),
         },
         'Gompertz': {
             'func': gompertz_model,
+            'jac': gompertz_jac,        # <--- ADDED
             'p0': [y_range * 1.1, 1.0, 0.1, y_min],
             'bounds': ([y_range * 0.8, 0.01, 1e-4, d_lo],
                        [max(2.0, y_range * 2.2), 100.0, 50.0, d_hi]),
         },
         'Trending Sine': {
             'func': linear_sine_model,
-            # p0: [Amp, Freq (guess 2 periods), Phase, Slope, Offset]
-            # We guess the amplitude is small (10% of range) and the slope handles the bulk of the rise.
-            'p0': [y_range * 0.1, 2 * 2 * np.pi, 0.0, y_range, y_min],
-            'bounds': (
-                # Lower bounds: [Amp, Freq (min 1 period), Phase, Slope, Offset]
-                [1e-5, 2 * np.pi, -np.pi, -np.inf, d_lo],           
-                # Upper bounds: [Amp, Freq (max 5 periods), Phase, Slope, Offset]
-                [y_range * 2.0, 10 * np.pi, np.pi, np.inf, d_hi]   
-            ),
+            'jac': linear_sine_jac,     # <--- ADDED
+            'p0': [y_range * 0.1, 3 * 2 * np.pi, 0.0, y_range, y_min],
+            'bounds': ([1e-5, 2 * np.pi, -np.pi, -np.inf, d_lo],
+                       [y_range * 2.0, 10 * np.pi, np.pi, np.inf, d_hi]),
         },
     }
+
 
 
 # ---------------------------------------------------------
@@ -350,7 +442,12 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
 
     results = {}
 
-    for name, config in models_config.items():
+    for name in AVAILABLE_MODELS:
+        # Failsafe: Ensure the model actually has a configuration built
+        if name not in models_config:
+            continue
+            
+        config = models_config[name]
         try:
             p0 = config['p0']
             k = len(p0)  # Number of parameters used for AIC penalty
@@ -363,6 +460,7 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
 
             params, _ = curve_fit(
                 config['func'], t_fit, y_fit, p0=p0,
+                jac=config.get('jac'),
                 bounds=config['bounds'], method='trf', maxfev=maxfev
             )
             preds = config['func'](t_fit, *params)
@@ -420,23 +518,30 @@ def process_single_channel_worker(channel, active_df, outlier_factor, outlier_wi
                                   break_sustained, z_factor, z_sustained, min_mse_floor, 
                                   req_break, step_days, window_size, eval_window, 
                                   override_model, manual_model, use_dynamic_variance, 
-                                  variance_window, priority_dict, ema_span, origin_date,
+                                  variance_window, priority_dict, ema_span, origin_date,fit_freq,
                                   fleet_mean=0.0, fleet_std=1.0):
     """
     PURE FUNCTION: No Streamlit calls allowed here. 
     This runs entirely on a background CPU core.
     """
-    import numpy as np
-    import pandas as pd
     
-    # 1. Load Data
+    # 1. Load Daily Data (For loops, RUL math, and break detection)
     sensor_smooth, sensor_raw, time_arr = load_my_sensor_data(
-        active_df, col=channel, outlier_factor=outlier_factor, outlier_window=outlier_window
+        active_df, col=channel, outlier_factor=outlier_factor, outlier_window=outlier_window, target_freq='1D'
+    )
+    
+    # 1b. Load High-Freq Data (For curve fitting and variance)
+    fit_smooth, fit_raw, fit_time = load_my_sensor_data(
+        active_df, col=channel, outlier_factor=outlier_factor, outlier_window=outlier_window, target_freq=fit_freq
     )
     
     time_arr_np = np.asarray(time_arr, dtype=float)
     smooth_np = np.asarray(sensor_smooth, dtype=float)
     raw_np = np.asarray(sensor_raw, dtype=float)  
+    
+    fit_time_np = np.asarray(fit_time, dtype=float)
+    fit_smooth_np = np.asarray(fit_smooth, dtype=float)
+    fit_raw_np = np.asarray(fit_raw, dtype=float)
 
     crossing_indices = np.where(smooth_np >= target_thresh)[0]
     actual_crossing_day = time_arr_np[crossing_indices[0]] if len(crossing_indices) > 0 else np.nan
@@ -480,7 +585,12 @@ def process_single_channel_worker(channel, active_df, outlier_factor, outlier_wi
 
     channel_results = []
     
-    # 3. The Timestep Loop (Running silently in background)
+    # Calculate point conversions for the high-frequency array
+    freq_hours = int(fit_freq.replace('h', ''))
+    eval_win_points = int(eval_window * (24 / freq_hours))
+    var_win_points = max(1, int(variance_window * (24 / freq_hours)))
+
+    # 3. The Timestep Loop 
     for step_idx, current_cutoff in enumerate(timesteps):
         fit_start_idx = max(0, current_cutoff - window_size)
         
@@ -488,20 +598,28 @@ def process_single_channel_worker(channel, active_df, outlier_factor, outlier_wi
         hist_smooth = smooth_np[fit_start_idx:current_cutoff]
         hist_raw = raw_np[fit_start_idx:current_cutoff] 
         current_day = hist_time[-1]
+        
+        # --- Slice the High-Frequency Array ---
+        lookback_cutoff = current_day - window_size
+        fit_mask = (fit_time_np >= lookback_cutoff) & (fit_time_np <= current_day)
+        
+        hf_time = fit_time_np[fit_mask]
+        hf_smooth = fit_smooth_np[fit_mask]
+        hf_raw = fit_raw_np[fit_mask]
 
-        eval_win = min(eval_window, len(hist_time))
+        eval_win = min(eval_win_points, len(hf_time))
 
         if override_model:
             best_model = manual_model
             mse_log_str = f"{manual_model}: (override - competition skipped)"
             raw_n, raw_u, raw_l = calculate_rul_headless(
-                hist_time, hist_smooth, hist_raw, best_model, target_thresh,
+                hf_time, hf_smooth, hf_raw, best_model, target_thresh,
                 use_dynamic_variance=use_dynamic_variance, precomputed_params=None,
-                variance_window=variance_window
+                variance_window=var_win_points
             )
         else:
             top_models, all_models = evaluate_all_models(
-                hist_time, hist_smooth, priority_ranking=priority_dict,
+                hf_time, hf_smooth, priority_ranking=priority_dict,
                 eval_window=eval_win, plot=False, verbose=False,
                 warm_start=warm_start_cache, min_mse_floor=min_mse_floor
             )
@@ -524,9 +642,9 @@ def process_single_channel_worker(channel, active_df, outlier_factor, outlier_wi
                                 if v.get('params') is not None}
 
             raw_n, raw_u, raw_l = calculate_rul_headless(
-                hist_time, hist_smooth, hist_raw, best_model, target_thresh,
+                hf_time, hf_smooth, hf_raw, best_model, target_thresh,
                 use_dynamic_variance=use_dynamic_variance, precomputed_params=winner_params,
-                variance_window=variance_window
+                variance_window=var_win_points
             )
 
         ema_n, store_n = _ema_update(ema_n, raw_n)
@@ -820,7 +938,7 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
                          input_time_unit="Hours", target_time_unit="Days", warm_start_params=None,
                          title_addon="", sigma_factor=1.645, save_name=None, max_rul_display=RUL_HORIZON,
                          use_dynamic_variance=True, break_time_raw=None, precomputed_params=None,
-                         variance_window=20):
+                         variance_window=20,use_absolute_dates=False, hf_time=None, hf_sensor_raw=None):
     """
     OPT-A: Accepts `precomputed_params` so the deep-dive page can pass the winner's
     already-fitted params from evaluate_all_models and skip a redundant curve_fit.
@@ -973,49 +1091,93 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     upper_env_smooth = smooth_preds + (dynamic_std_smooth * sigma_factor)
     lower_env_smooth = smooth_preds - (dynamic_std_smooth * sigma_factor)
 
-    # --- NEW: Extract and calculate calendar dates for hover text ---
+    true_origin_date = None 
+    
     if isinstance(orig_index, pd.DatetimeIndex) and len(orig_index) > 0:
-        origin_date = orig_index.min()
+        window_start_date = orig_index.min()
+        window_start_elapsed_days = time_arr[0]
+        true_origin_date = window_start_date - pd.Timedelta(days=window_start_elapsed_days)
+        
         raw_dates = orig_index.strftime('%Y-%m-%d').tolist()
-        # Convert the smooth time array back to days to add to the origin date
         days_smooth = time_smooth_converted / conversion_factor
-        smooth_dates = [(origin_date + pd.Timedelta(days=d)).strftime('%Y-%m-%d') for d in days_smooth]
+        smooth_dates = [(true_origin_date + pd.Timedelta(days=d)).strftime('%Y-%m-%d') for d in days_smooth]
     else:
         raw_dates = [''] * len(sensor_raw_arr)
         smooth_dates = [''] * len(time_smooth_converted)
+
     # ---------------------------------------------------------------
+    # 2. DYNAMIC X-AXIS ROUTING (Elapsed vs Absolute)
+    # ---------------------------------------------------------------
+    if use_absolute_dates and true_origin_date is not None:
+        x_raw = [true_origin_date + pd.Timedelta(days=t/conversion_factor) for t in time_arr_converted]
+        x_smooth = [true_origin_date + pd.Timedelta(days=t/conversion_factor) for t in time_smooth_converted]
+        
+        # --- NEW: Process High-Frequency X-Axis ---
+        if hf_time is not None:
+            hf_time_converted = np.asarray(hf_time, dtype=float) * conversion_factor
+            x_hf = [true_origin_date + pd.Timedelta(days=t/conversion_factor) for t in hf_time_converted]
+            
+        x_axis_label = "Calendar Date"
+        x_range = [true_origin_date, true_origin_date + pd.Timedelta(days=final_end_time/conversion_factor)]
+        
+        def to_x(elapsed_converted):
+            return true_origin_date + pd.Timedelta(days=elapsed_converted/conversion_factor)
+    else:
+        x_raw = time_arr_converted
+        x_smooth = time_smooth_converted
+        
+        # --- NEW: Process High-Frequency X-Axis ---
+        if hf_time is not None:
+            x_hf = np.asarray(hf_time, dtype=float) * conversion_factor
+            
+        x_axis_label = f"Elapsed Time ({target_time_unit})"
+        x_range = [0, final_end_time]
+        
+        def to_x(elapsed_converted):
+            return elapsed_converted
 
     fig = go.Figure()
     
-    # --- UPDATED: Added customdata and hovertemplate to traces ---
-    fig.add_trace(go.Scatter(x=time_arr_converted, y=sensor_raw_arr, mode='markers',
-                             name='Max Envelope Data', marker=dict(color='gray', size=5, opacity=0.7),
-                             hovertemplate='Actual Value: %{y:.3f}<extra></extra>'))
+    # --- NEW: 0. HIGH-FREQUENCY BACKGROUND TRACE ---
+    if hf_time is not None and hf_sensor_raw is not None:
+        fig.add_trace(go.Scatter(
+            x=x_hf, 
+            y=np.asarray(hf_sensor_raw, dtype=float), 
+            mode='markers',
+            name='High-Freq Envelope Data', 
+            marker=dict(color='gray', size=6, opacity=0.5), # Faint blue dots
+            hovertemplate='HF Value: %{y:.3f}<extra></extra>'
+        ))
+
+    # 1. RAW DATA (Daily Max/Median)
+    fig.add_trace(go.Scatter(x=x_raw, y=sensor_raw_arr, mode='markers',
+                             name='Daily Envelope Data', marker=dict(color='gray', size=6, opacity=0.9),
+                             hovertemplate='Daily Value: %{y:.3f}<extra></extra>'))
                              
-    # 2. NOMINAL FIT: Kept the Date! Since this line is continuous, it serves as our single date label.
-    fig.add_trace(go.Scatter(x=time_smooth_converted, y=smooth_preds, mode='lines',
+    # 2. NOMINAL FIT
+    fig.add_trace(go.Scatter(x=x_smooth, y=smooth_preds, mode='lines',
                              name=f'{model_choice} Fit', line=dict(color='blue', width=2.5), opacity=0.8,
                              customdata=smooth_dates,
                              hovertemplate='<b>Date: %{customdata}</b><br>Pred: %{y:.3f}<extra></extra>'))
                              
-    # 3. CONFIDENCE FILL: Skipping hover entirely so it doesn't duplicate the band lines
-    fig.add_trace(go.Scatter(x=time_smooth_converted, y=lower_env_smooth, mode='lines',
+    # 3. CONFIDENCE FILL
+    fig.add_trace(go.Scatter(x=x_smooth, y=lower_env_smooth, mode='lines',
                              line=dict(width=0), showlegend=False, hoverinfo='skip'))
                              
     band_name = f'±{sigma_factor}σ Confidence Band' + (' (Dynamic)' if use_dynamic_variance else ' (Static)')
     
-    fig.add_trace(go.Scatter(x=time_smooth_converted, y=upper_env_smooth, mode='lines',
+    fig.add_trace(go.Scatter(x=x_smooth, y=upper_env_smooth, mode='lines',
                              line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 0, 255, 0.15)', name=band_name,
-                             hoverinfo='skip')) # <-- ensure hover is skipped on the transparent fill!
+                             hoverinfo='skip'))
                              
-    # 4. UPPER BAND: Removed date
-    fig.add_trace(go.Scatter(x=time_smooth_converted, y=upper_env_smooth, mode='lines',
+    # 4. UPPER BAND
+    fig.add_trace(go.Scatter(x=x_smooth, y=upper_env_smooth, mode='lines',
                              name=f'Upper Band ({risk_pct_upper:.1f}% Risk)',
                              line=dict(color='blue', width=1.5, dash='dashdot'), opacity=0.6,
                              hovertemplate='Upper: %{y:.3f}<extra></extra>'))
                              
-    # 5. LOWER BAND: Removed date
-    fig.add_trace(go.Scatter(x=time_smooth_converted, y=lower_env_smooth, mode='lines',
+    # 5. LOWER BAND
+    fig.add_trace(go.Scatter(x=x_smooth, y=lower_env_smooth, mode='lines',
                              name=f'Lower Band ({risk_pct_lower:.1f}% Risk)',
                              line=dict(color='blue', width=1.5, dash='dot'), opacity=0.4,
                              hovertemplate='Lower: %{y:.3f}<extra></extra>'))
@@ -1056,24 +1218,27 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
                 status_lines.append(f"<b>T={thresh:.2f} RUL</b> ➔ <b>Nominal:</b> {n_str} | <b>{risk_pct_upper:.1f}% Risk:</b> {u_str} | <b>{risk_pct_lower:.1f}% Risk:</b> {l_str}")
                 legend_lbl = f"T={thresh:.2f} (Nom: {n_str} | {risk_pct_upper:.1f}%: {u_str} | {risk_pct_lower:.1f}%: {l_str})"
 
-            fig.add_trace(go.Scatter(x=[0, final_end_time], y=[thresh, thresh], mode='lines',
+            # --- UPDATED: Uses dynamic x_range ---
+            fig.add_trace(go.Scatter(x=[x_range[0], x_range[1]], y=[thresh, thresh], mode='lines',
                                      name=legend_lbl, line=dict(color=c, width=2, dash='dash'), opacity=0.6))
 
+            # --- UPDATED: Uses to_x() for the markers ---
             if not pd.isna(row['Nominal_Abs_Time']) and row['Nominal_Abs_Time'] <= final_end_time:
-                fig.add_trace(go.Scatter(x=[row['Nominal_Abs_Time']], y=[thresh], mode='markers', showlegend=False,
+                fig.add_trace(go.Scatter(x=[to_x(row['Nominal_Abs_Time'])], y=[thresh], mode='markers', showlegend=False,
                                          marker=dict(symbol='circle', color=c, size=10, line=dict(color='black', width=1))))
             if not pd.isna(row['Upper_Abs_Time']) and row['Upper_Abs_Time'] <= final_end_time:
-                fig.add_trace(go.Scatter(x=[row['Upper_Abs_Time']], y=[thresh], mode='markers', showlegend=False,
+                fig.add_trace(go.Scatter(x=[to_x(row['Upper_Abs_Time'])], y=[thresh], mode='markers', showlegend=False,
                                          marker=dict(symbol='triangle-left', color=c, size=10, line=dict(color='black', width=1))))
             if not pd.isna(row['Lower_Abs_Time']) and row['Lower_Abs_Time'] <= final_end_time:
-                fig.add_trace(go.Scatter(x=[row['Lower_Abs_Time']], y=[thresh], mode='markers', showlegend=False,
+                fig.add_trace(go.Scatter(x=[to_x(row['Lower_Abs_Time'])], y=[thresh], mode='markers', showlegend=False,
                                          marker=dict(symbol='triangle-right', color=c, size=10, line=dict(color='black', width=1))))
 
     # --- Structural Break Visuals ---
     if break_time_raw is not None:
         break_time_converted = break_time_raw * conversion_factor
-        fig.add_vline(x=break_time_converted, line_width=2, line_dash="dash", line_color="orange")
-        fig.add_annotation(x=break_time_converted, y=y_max * 1.05 if y_max > 0 else 0,
+        # --- UPDATED: Uses to_x() ---
+        fig.add_vline(x=to_x(break_time_converted), line_width=2, line_dash="dash", line_color="orange")
+        fig.add_annotation(x=to_x(break_time_converted), y=y_max * 1.05 if y_max > 0 else 0,
                            text="⚠️ Structural Break", showarrow=False, yshift=10,
                            font=dict(color="orange", size=12))
         break_title_str = f" | <span style='color:orange;'><b>⚠️ Break Detected at {break_time_converted:.1f}{unit_short}</b></span>"
@@ -1095,30 +1260,29 @@ def fit_and_plotly_model(time_raw, sensor_smooth, sensor_raw, model_choice, thre
     
     fig.update_layout(
         title=full_title, 
-        xaxis_title=f"Elapsed Time ({target_time_unit})", 
+        xaxis_title=x_axis_label,     # <--- UPDATED: Dynamic Label
         yaxis_title="Sensor Value",
-        xaxis=dict(range=[0, final_end_time]),
+        xaxis=dict(range=x_range),    # <--- UPDATED: Dynamic Range
         yaxis=dict(range=[y_lower_limit, y_upper_limit], hoverformat=".3f"),
         hovermode="x unified", 
         template="plotly_white",
         
-        # --- UPDATED: Legend pushed below the chart ---
         legend=dict(
             title="System Log", 
-            orientation="v",         # Makes the legend items sit side-by-side
-            yanchor="top",           # Anchors the top of the legend box...
-            y=-0.15,                 # ...to just below the x-axis
-            xanchor="center",        # Anchors the center of the legend box...
-            x=0.5,                   # ...to the middle of the chart
+            orientation="v",         
+            yanchor="top",           
+            y=-0.15,                 
+            xanchor="center",        
+            x=0.5,                   
             bordercolor="LightSteelBlue", 
             borderwidth=1
         ),
         
-        # --- UPDATED: Added bottom margin (b=120) to prevent the legend from being cut off ---
         margin=dict(t=120 + (n_thresh * 15), b=120), 
         width=1200, 
         height=900
     )
+    
     fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(211, 211, 211, 0.4)')
     fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(211, 211, 211, 0.4)')
 
@@ -1149,26 +1313,30 @@ def get_available_channels(df):
     return [str(c) for c in cols]
 
 @st.cache_data
-def load_my_sensor_data(df, col='32', outlier_factor=3.0, outlier_window=42):
-    """Now accepts a dataframe instead of a file object."""
+def load_my_sensor_data(df, col='32', outlier_factor=3.0, outlier_window=42, target_freq='1D'):
     freq = '4h'
+    # Use 'numeric_only=True' to avoid warnings in newer pandas versions
     df_resampled = df.resample(freq).mean(numeric_only=True)
 
     if col not in df_resampled.columns:
-        return pd.Series(), pd.Series(), pd.Series()
+        return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float)
 
     df_select = df_resampled[[col]].copy()
     df_select = df_select.interpolate(method='time', limit=1)
-    df_select = rolling_iqr_filter(df_select, factor=outlier_factor, window=outlier_window)
+    df_select = rolling_iqr_filter(df_select, factor=outlier_factor, window=outlier_window)  # 6 * 4h = 1 day
 
-    window = int(1 * 24 / 4)
+    window = int(24 / 4) # 1 Day
     df_select[f'{col}_max'] = df_select[col].rolling(window=window * 5, min_periods=1).max()
     df_select[f'{col}_max_ema'] = df_select[f'{col}_max'].ewm(span=window * 5, adjust=False, ignore_na=True).mean()
 
-    df_daily = df_select.resample('D').mean()
-    df_daily['elapsed_days'] = (df_daily.index - df_daily.index.min()).days
+    # Resample to the requested target frequency
+    df_target = df_select.resample(target_freq).mean(numeric_only=True)
+    
+    # CRITICAL FIX: Use total_seconds to create fractional elapsed days
+    origin = df_target.index.min()
+    df_target['elapsed_days'] = (df_target.index - origin).total_seconds() / 86400.0
 
-    return df_daily[f'{col}_max_ema'], df_daily[f'{col}_max'], df_daily['elapsed_days']
+    return df_target[f'{col}_max_ema'], df_target[f'{col}_max'], df_target['elapsed_days']
 
 # ---------------------------------------------------------
 # 6. Headless Math Engine (No Plotly rendering for speed)
@@ -1206,6 +1374,7 @@ def calculate_rul_headless(time_raw, sensor_smooth, sensor_raw, model_choice, th
     else:
         try:
             params, _ = curve_fit(func, t_fit, y_fit, p0=config['p0'],
+                                  jac=config.get('jac'),
                                   bounds=config['bounds'], method='trf', maxfev=5000)
         except Exception:
             return np.nan, np.nan, np.nan
@@ -1250,14 +1419,41 @@ def generate_simulation_dashboards(raw_df):
     """
     df = raw_df.copy()
 
-    # FORCE CATEGORICAL Y-AXIS
+    # FORCE STRING FORMAT FOR Y-AXIS
     df['Channel'] = "CH-" + df['Channel'].astype(str)
+
+    # =====================================================
+    # 1. CUSTOM SORTING LOGIC FOR HEATMAPS
+    # =====================================================
+    unique_channels = df['Channel'].unique().tolist()
+    
+    custom_order_list = [1, 3, 5, 7, 9, 11, 13, 15, 17, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22,
+          24, 26, 28, 30, 32, 34, 36, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 39,
+          41, 43, 45, 47, 49, 51, 53, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58,
+          60, 62, 64, 66, 68, 70, 72, 55, 57, 59, 61, 63, 65, 67, 69, 71, 73, 75,
+          77, 79, 81, 83, 85, 87, 89, 74, 76, 78, 80, 82, 84, 86, 88, 90]
+    
+    # Map them to "CH-{number}" format so they match the dataframe strings
+    order_map = {f"CH-{ch}": rank for rank, ch in enumerate(custom_order_list)}
+    
+    # Split synthetic and base channels
+    synth_channels = [c for c in unique_channels if "INJECT_" in c or "MUTATE_" in c]
+    synth_channels.sort()
+    
+    base_channels = [c for c in unique_channels if c not in synth_channels]
+    base_channels.sort(key=lambda c: (order_map.get(c, 9999), c))
+    
+    # Combine into the master sequence
+    final_channel_order = synth_channels + base_channels
+    
+    # Convert the column to a strict Pandas Categorical to force pivot_table to respect the order
+    df['Channel'] = pd.Categorical(df['Channel'], categories=final_channel_order, ordered=True)
+    # =====================================================
 
     st.markdown("---")
     st.header("📊 Fleet Backtesting Results")
 
     st.markdown("### Operational Thresholds")
-    # Added a third column for the RUL Evaluation Mode
     col_aw, col_hz, col_mode = st.columns(3)
     
     with col_aw:
@@ -1281,7 +1477,6 @@ def generate_simulation_dashboards(raw_df):
             help="Choose which statistical confidence band to evaluate against the actual failure."
         )
 
-    # Map the selected mode to the correct dataframe column
     if "Conservative" in rul_mode:
         eval_col = 'Upper_Risk_RUL'
     elif "Optimistic" in rul_mode:
@@ -1289,35 +1484,20 @@ def generate_simulation_dashboards(raw_df):
     else:
         eval_col = 'Nominal_RUL'
 
-    # Create a dynamic column that the rest of the dashboard will use
     df['Selected_RUL'] = df[eval_col]
 
-    # -----------------------------------------------------
-    # HORIZON-CAPPED COLUMNS (continuous charts B & C only).
-    # NaN actual/predicted ("never reached") -> full horizon so a position exists.
-    # -----------------------------------------------------
+    # HORIZON-CAPPED COLUMNS
     df['Selected_RUL_c'] = df['Selected_RUL'].apply(lambda x: to_horizon(x, display_horizon))
     df['Actual_RUL_c']  = df['Actual_RUL'].apply(lambda x: to_horizon(x, display_horizon))
 
-    # -----------------------------------------------------
-    # CHART A STATUS: Updated Tolerance and Horizon Logic
-    # -----------------------------------------------------
+    # CHART A STATUS
     df['Status'] = 'Unknown'
-
-    # Treat NaN as infinite (never reaches threshold) for logical comparisons
     act_val = df['Actual_RUL'].fillna(np.inf)
     pred_val = df['Selected_RUL'].fillna(np.inf)
 
-    # 1. True Negative: Both are safely beyond the display horizon
     is_tn = (act_val > display_horizon) & (pred_val > display_horizon)
-
-    # 2. True Positive: The prediction is within the action window tolerance of the actual RUL
     is_tp = (abs(pred_val - act_val) <= action_window) & ~is_tn
-
-    # 3. False Positive: Predicted failure is earlier than actual (and not a TP/TN)
     is_fp = (pred_val < act_val) & ~is_tp & ~is_tn
-
-    # 4. False Negative: Predicted failure is later than actual (and not a TP/TN)
     is_fn = (pred_val > act_val) & ~is_tp & ~is_tn
 
     df.loc[is_tn, 'Status'] = 'True Negative'
@@ -1325,15 +1505,12 @@ def generate_simulation_dashboards(raw_df):
     df.loc[is_fp, 'Status'] = 'False Positive'
     df.loc[is_fn, 'Status'] = 'False Negative'
 
-    # -----------------------------------------------------
-    # BIAS SCORE: computed from CAPPED columns -> no NaN holes in Chart B.
-    # -----------------------------------------------------
+    # BIAS SCORE
     error = df['Selected_RUL_c'] - df['Actual_RUL_c']
     df['Bias_Score'] = np.clip((error + action_window) / (action_window * 2), 0.0, 1.0)
 
     df['Eval_Day_Rounded'] = df['Evaluation_Day'].round().astype(int)
 
-    # Hover keeps RAW semantics: NaN prediction is explicitly "never reached", not a number.
     def _fmt_pred(x):
         if pd.isna(x):
             return "Never reaches threshold (Safe)"
@@ -1342,9 +1519,10 @@ def generate_simulation_dashboards(raw_df):
     df['Hover_Pred'] = df['Selected_RUL'].apply(_fmt_pred)
     df['Hover_Act'] = df['Actual_RUL'].apply(lambda x: f"{x:.1f} Days" if pd.notna(x) else "Never Breaches")
 
-    pivot_pred = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Pred', aggfunc='first')
-    pivot_act = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Act', aggfunc='first')
-    pivot_date = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Evaluation_Date', aggfunc='first')
+    # The pivot tables will automatically order their index based on the pd.Categorical we created!
+    pivot_pred = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Pred', aggfunc='first', observed=True)
+    pivot_act = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Act', aggfunc='first', observed=True)
+    pivot_date = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Evaluation_Date', aggfunc='first', observed=True)
     
     color_map_status = {"True Positive": "#4CAF50", "False Positive": "#FFB74D",
                         "True Negative": "#E8F5E9", "False Negative": "#F44336"}
@@ -1363,13 +1541,17 @@ def generate_simulation_dashboards(raw_df):
 
     status_map = {"True Negative": 0, "False Positive": 1, "True Positive": 2, "False Negative": 3}
     df['Status_Code'] = df['Status'].map(status_map)
-
-    pivot_status_code = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status_Code', aggfunc='first')
-    pivot_status_text = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status', aggfunc='first')
+    df['Model_Used'] = df['Model_Used'].fillna('Unknown')
+    
+    pivot_model = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Model_Used', aggfunc='first', observed=True)
+    pivot_status_code = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status_Code', aggfunc='first', observed=True)
+    pivot_status_text = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Status', aggfunc='first', observed=True)
+    
     customdata_a = np.dstack((pivot_status_text.values,
                               pivot_pred.reindex_like(pivot_status_text).values,
                               pivot_act.reindex_like(pivot_status_text).values,
-                              pivot_date.reindex_like(pivot_status_text).values))
+                              pivot_date.reindex_like(pivot_status_text).values,
+                              pivot_model.reindex_like(pivot_status_text).values))
 
     colorscale_a = [[0.0, '#E8F5E9'], [0.33, '#FFB74D'], [0.66, '#4CAF50'], [1.0, '#F44336']]
 
@@ -1377,15 +1559,20 @@ def generate_simulation_dashboards(raw_df):
     fig_a.add_trace(go.Heatmap(
         z=pivot_status_code.values, x=pivot_status_code.columns, y=pivot_status_code.index,
         colorscale=colorscale_a, zmin=0, zmax=3, showscale=False, hoverongaps=False, customdata=customdata_a,
-        hovertemplate="<b>Date:</b> %{customdata[3]}<br><b>Day:</b> %{x}<br><b>Channel:</b> %{y}<br><b>Result:</b> %{customdata[0]}<br><b>Predicted:</b> %{customdata[1]}<br><b>Actual:</b> %{customdata[2]}<extra></extra>"
-        ))
+        hovertemplate="<b>Date:</b> %{customdata[3]}<br><b>Day:</b> %{x}<br><b>Channel:</b> %{y}<br><b>Result:</b> %{customdata[0]}<br><b>Predicted:</b> %{customdata[1]}<br><b>Actual:</b> %{customdata[2]}<br><b>Engine:</b> %{customdata[4]}<extra></extra>"
+    ))       
     for name, color in [("True Negative (Safe)", '#E8F5E9'), ("False Positive (Early Alarm)", '#FFB74D'),
                         ("True Positive (Correct Detection)", '#4CAF50'), ("False Negative (Missed Crossing)", '#F44336')]:
         fig_a.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
                                    marker=dict(size=15, color=color, symbol='square', line=dict(color='black', width=1)), name=name))
+    
+    # Calculate dynamic height (20px per row, min 400px)
+    dynamic_height = max(400, 600)
+    
     fig_a.update_layout(
-        xaxis_title="Simulation Day", yaxis_title="Channel", height=400, template="plotly_white", margin=dict(t=30, b=30),
-        yaxis=dict(type='category', autorange="reversed"),
+        xaxis_title="Simulation Day", yaxis_title="Channel", height=dynamic_height, template="plotly_white", margin=dict(t=30, b=30),
+        # Explicitly lock Plotly's y-axis to the exact array order
+        yaxis=dict(type='category', categoryorder='array', categoryarray=final_channel_order, autorange="reversed"),
         legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5, title=None)
     )
     st.plotly_chart(fig_a, use_container_width=True)
@@ -1402,10 +1589,10 @@ def generate_simulation_dashboards(raw_df):
     )
 
     rocket_palette = sns.color_palette("mako", n_colors=256).as_hex()
-    pivot_bias = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Bias_Score', aggfunc='first')
+    pivot_bias = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Bias_Score', aggfunc='first', observed=True)
 
     df['Hover_Bias'] = df['Bias_Score'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
-    pivot_bias_text = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Bias', aggfunc='first')
+    pivot_bias_text = df.pivot_table(index='Channel', columns='Eval_Day_Rounded', values='Hover_Bias', aggfunc='first', observed=True)
     customdata_b = np.dstack((pivot_bias_text.reindex_like(pivot_bias).values,
                               pivot_pred.reindex_like(pivot_bias).values,
                               pivot_act.reindex_like(pivot_bias).values,
@@ -1418,8 +1605,9 @@ def generate_simulation_dashboards(raw_df):
         hovertemplate="<b>Date:</b> %{customdata[3]}<br><b>Day:</b> %{x}<br><b>Channel:</b> %{y}<br><b>Bias Score:</b> %{customdata[0]}<br><b>Predicted:</b> %{customdata[1]}<br><b>Actual:</b> %{customdata[2]}<extra></extra>"
     ))
     fig_b.update_layout(
-        xaxis_title="Simulation Day", yaxis_title="Channel", height=400, template="plotly_white", margin=dict(t=30, b=30),
-        yaxis=dict(type='category', autorange="reversed")
+        xaxis_title="Simulation Day", yaxis_title="Channel", height=dynamic_height, template="plotly_white", margin=dict(t=30, b=30),
+        # Explicitly lock Plotly's y-axis to the exact array order
+        yaxis=dict(type='category', categoryorder='array', categoryarray=final_channel_order, autorange="reversed")
     )
     st.plotly_chart(fig_b, use_container_width=True)
 
@@ -1522,7 +1710,7 @@ def generate_simulation_dashboards(raw_df):
 def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outlier_window,
                          use_dynamic_variance, break_algo, break_window, break_step, break_sustained,
                          z_factor, z_sustained, override_model, manual_model,
-                         window_size, eval_window,variance_window, min_mse_floor):
+                         window_size, eval_window,variance_window, min_mse_floor,fit_freq):
     st.title("Fleet-Wide Live Simulation")
     st.markdown("Run the predictive engine across all channels and all historical timesteps to generate statistical confidence metrics.")
 
@@ -1591,8 +1779,8 @@ def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outl
                     break_sustained, z_factor, z_sustained, min_mse_floor, 
                     req_break, step_days, window_size, eval_window, 
                     override_model, manual_model, use_dynamic_variance, 
-                    variance_window, priority_dict, ema_span, origin_date,
-                    fleet_mean, fleet_std
+                    variance_window, priority_dict, ema_span, origin_date,fit_freq,
+                    fleet_mean, fleet_std,
                 )
                 futures.append(future)
 
@@ -2180,10 +2368,27 @@ def main():
             else:
                 display_to_col[c] = c
                 base_options.append(c)
+                
+        custom_order_list = [1, 3, 5, 7, 9, 11, 13, 15, 17, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22,
+          24, 26, 28, 30, 32, 34, 36, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 39,
+          41, 43, 45, 47, 49, 51, 53, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58,
+          60, 62, 64, 66, 68, 70, 72, 55, 57, 59, 61, 63, 65, 67, 69, 71, 73, 75,
+          77, 79, 81, 83, 85, 87, 89, 74, 76, 78, 80, 82, 84, 86, 88, 90]
 
-        # Sort so Synthetic are ALWAYS at the top, then base options alphabetically
+        order_map = {str(ch): rank for rank, ch in enumerate(custom_order_list)}
+
+        # Sort synthetic options alphabetically (keeping them grouped at the top)
         synth_options.sort()
-        base_options.sort()
+        
+        # Sort base options using the custom order map
+        # Tuple sorting: (Rank in custom list, Alphabetical fallback for unknowns)
+        # 9999 ensures any channels NOT in your custom list fall to the very bottom
+        base_options.sort(key=lambda disp_name: (
+            order_map.get(display_to_col[disp_name], 9999), 
+            disp_name
+        ))
+
+        # Combine them (Synthetics first, then your custom-ordered base channels)
         display_options = synth_options + base_options
 
         selected_display = st.sidebar.selectbox("Select Data Channel to Analyze", options=display_options)
@@ -2213,11 +2418,17 @@ def main():
         "AIC Evaluation Window (Last N Days)", min_value=1, max_value=window_size, value=min(50, window_size), step=1,
         help=" Recent days used to compute the Tail-Weighted AIC. Unlike simple error (MSE), AIC penalizes complex curves to prevent overfitting. A lower score is better."
     )
+    fit_freq_hours = st.sidebar.number_input(
+    "Model Fitting Frequency (Hours)", min_value=4, value=8, step=1,
+    help="Higher frequency gives the math engine more points. UI remains daily."
+    )
+    # Convert integer to pandas frequency string (e.g., '8h')
+    fit_freq = f"{fit_freq_hours}h"
 
     st.sidebar.markdown("### Outlier Filtering")
     outlier_factor = st.sidebar.slider("IQR Outlier Factor", min_value=0.5, max_value=10.0, value=3.0, step=0.1)
-    outlier_window = st.sidebar.number_input("Rolling Window (4h Periods)", min_value=5, max_value=200, value=42, step=1)
-
+    outlier_window = st.sidebar.number_input("Rolling Window (Days)", min_value=1, max_value=100, value=5, step=1)
+    outlier_window = outlier_window*6 #6*4h = 24h
     st.sidebar.markdown("### Variance Configuration")
     use_dynamic_variance = st.sidebar.toggle(
         "Use Dynamic Variance (Linear Fit)", 
@@ -2317,13 +2528,20 @@ def main():
         )
 
     elif app_mode == "Deep-Dive Analysis":
+        # 1. Load Daily Data (For UI Display & Tracking)
         sensor_arr_smooth, sensor_array_raw, time_arr = load_my_sensor_data(
-            active_df, col=selected_col, outlier_factor=outlier_factor, outlier_window=outlier_window
+            active_df, col=selected_col, outlier_factor=outlier_factor, 
+            outlier_window=outlier_window, target_freq='1D'
+        )
+        
+        # 2. Load High-Frequency Data (Strictly for Mathematical Fitting)
+        fit_sensor_smooth, fit_sensor_raw, fit_time_arr = load_my_sensor_data(
+            active_df, col=selected_col, outlier_factor=outlier_factor, 
+            outlier_window=outlier_window, target_freq=fit_freq
         )
 
-        # --- Dynamic Structural Break Router ---
+        # --- Dynamic Structural Break Router (Runs on Daily Data) ---
         if break_algo == "Fleet Z-Score":
-            # Anchor to base_df
             fleet_mean, fleet_std = compute_fleet_baseline(base_df, outlier_factor, outlier_window)
             break_idx, break_time, _eval_start_idx = detect_zscore_break(
                 time_arr, sensor_arr_smooth, fleet_mean, fleet_std, z_factor, z_sustained, min_mse_floor=min_mse_floor
@@ -2337,27 +2555,42 @@ def main():
         thresholds = [0.2, 0.3]
 
         st.markdown("### Time Navigation")
-
-        # --- ADAPTIVE SLIDER BOUNDS ---
         slider_min = min(10, max_index)
         default_val = max(slider_min, max_index // 2)
 
         cutoff_idx = st.slider(
             "Select the Current Time Point (Data Cutoff)",
-            min_value=slider_min,
-            max_value=max_index,
-            value=default_val
+            min_value=slider_min, max_value=max_index, value=default_val
         )
+        
+        use_abs_dates = st.toggle("Display Absolute Calendar Dates on X-Axis", value=False)
 
         with st.spinner(f"Analyzing models and calculating RUL for index {cutoff_idx}..."):
+            # A) Slice the Daily Data for the UI
             start_idx = max(0, cutoff_idx - window_size)
             sliced_time = time_arr[start_idx:cutoff_idx]
             sliced_sensor = sensor_arr_smooth[start_idx:cutoff_idx]
             sliced_sensor_raw = sensor_array_raw[start_idx:cutoff_idx]
+            
+            # B) Slice the High-Frequency Data for the Math Engine & Plotting
+            current_elapsed_days = sliced_time.iloc[-1] if not sliced_time.empty else 0
+            lookback_cutoff = current_elapsed_days - window_size
+            
+            # Create the mask
+            fit_mask = (fit_time_arr >= lookback_cutoff) & (fit_time_arr <= current_elapsed_days)
+            
+            # Apply the mask to all three high-frequency arrays
+            hf_time = fit_time_arr[fit_mask]
+            hf_sensor = fit_sensor_smooth[fit_mask]
+            hf_raw = fit_sensor_raw[fit_mask]   # <--- THIS WAS MISSING
+            
+            # Convert evaluation window (days) to high-freq points
+            freq_hours = int(fit_freq.replace('h', ''))
+            eval_win_points = int(eval_window * (24 / freq_hours))
 
             top_models, all_models = evaluate_all_models(
-                sliced_time, sliced_sensor, priority_ranking=user_priority_dict,
-                eval_window=eval_window, plot=False, verbose=False, min_mse_floor=min_mse_floor
+                hf_time, hf_sensor, priority_ranking=user_priority_dict,
+                eval_window=eval_win_points, plot=False, verbose=False, min_mse_floor=min_mse_floor
             )
 
             if not top_models:
@@ -2371,13 +2604,15 @@ def main():
                 best_model_name = list(top_models.keys())[0]
                 reuse_params = top_models[best_model_name].get('params')
 
+            # Render UI using Daily Data + High-Freq Parameters
             fig, fitted_series, rul_df = fit_and_plotly_model(
                 time_raw=sliced_time, sensor_smooth=sliced_sensor, sensor_raw=sliced_sensor_raw,
                 model_choice=best_model_name, thresholds=thresholds, input_time_unit="Days",
                 title_addon=f"| Channel: {selected_col} | Cutoff: {cutoff_idx}",
                 max_rul_display=max_rul, use_dynamic_variance=use_dynamic_variance,
                 break_time_raw=break_time, precomputed_params=reuse_params,
-                variance_window=variance_window
+                variance_window=variance_window, use_absolute_dates=use_abs_dates,
+                hf_time=hf_time, hf_sensor_raw=hf_raw
             )
 
             plot_col, side_metrics_col = st.columns([3, 1])
@@ -2451,7 +2686,7 @@ def main():
             active_df, base_df, user_priority_dict, outlier_factor, outlier_window,
             use_dynamic_variance, break_algo, break_window, break_step, break_sustained,
             z_factor, z_sustained, override_model, manual_model,
-            window_size, eval_window,variance_window, min_mse_floor
+            window_size, eval_window,variance_window, min_mse_floor, fit_freq
         )
 
 
