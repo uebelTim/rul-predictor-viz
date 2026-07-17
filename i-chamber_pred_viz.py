@@ -512,25 +512,22 @@ def evaluate_all_models(time_data, sensor_data, priority_ranking, eval_window=No
 
 
 
-# Put this at the top level of your script, outside any UI functions
 def process_single_channel_worker(channel, active_df, outlier_factor, outlier_window, 
-                                  target_thresh, break_algo, break_window, break_step, 
+                                  target_thresh, crossing_sustained,
+                                  break_algo, break_window, break_step, 
                                   break_sustained, z_factor, z_sustained, min_mse_floor, 
                                   req_break, step_days, window_size, eval_window, 
                                   override_model, manual_model, use_dynamic_variance, 
-                                  variance_window, priority_dict, ema_span, origin_date,fit_freq,
+                                  variance_window, priority_dict, ema_span, origin_date,
+                                  fit_freq,
                                   fleet_mean=0.0, fleet_std=1.0):
-    """
-    PURE FUNCTION: No Streamlit calls allowed here. 
-    This runs entirely on a background CPU core.
-    """
     
-    # 1. Load Daily Data (For loops, RUL math, and break detection)
+    # 1. Load Daily Data
     sensor_smooth, sensor_raw, time_arr = load_my_sensor_data(
         active_df, col=channel, outlier_factor=outlier_factor, outlier_window=outlier_window, target_freq='1D'
     )
     
-    # 1b. Load High-Freq Data (For curve fitting and variance)
+    # 1b. Load High-Freq Data
     fit_smooth, fit_raw, fit_time = load_my_sensor_data(
         active_df, col=channel, outlier_factor=outlier_factor, outlier_window=outlier_window, target_freq=fit_freq
     )
@@ -543,8 +540,21 @@ def process_single_channel_worker(channel, active_df, outlier_factor, outlier_wi
     fit_smooth_np = np.asarray(fit_smooth, dtype=float)
     fit_raw_np = np.asarray(fit_raw, dtype=float)
 
-    crossing_indices = np.where(smooth_np >= target_thresh)[0]
-    actual_crossing_day = time_arr_np[crossing_indices[0]] if len(crossing_indices) > 0 else np.nan
+    # --- NEW: SUSTAINED CROSSING LOGIC ---
+    actual_crossing_day = np.nan
+    consecutive = 0
+    
+    for i, val in enumerate(smooth_np):
+        # Ignore NaNs, increment streak if above threshold
+        if not np.isnan(val) and val >= target_thresh:
+            consecutive += 1
+            if consecutive > crossing_sustained:
+                # Record the day the streak *started*
+                actual_crossing_day = time_arr_np[i - crossing_sustained + 1]
+                break
+        else:
+            consecutive = 0 # Reset streak on drop or missing data
+    # -------------------------------------
 
     # 2. Structural Break Detection
     if break_algo == "Fleet Z-Score":
@@ -1715,7 +1725,7 @@ def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outl
     st.markdown("Run the predictive engine across all channels and all historical timesteps to generate statistical confidence metrics.")
 
     st.markdown("### Simulation Setup")
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         req_break = st.toggle("Require Structural Break", value=False,
                               help=" ON: only evaluate AFTER a detected bend. OFF: evaluate from Day 50 onward.")
@@ -1726,6 +1736,9 @@ def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outl
         target_thresh = st.number_input("Target Threshold", min_value=0.1, max_value=5.0, value=0.2, step=0.1,
                                         help=" The critical limit line.")
     with col4:
+        crossing_sustained = st.number_input("Threshold Sustained (Days)", min_value=1, max_value=30, value=3, step=1,
+                                             help="Signal must stay above the threshold for N consecutive days to count as an actual failure (filters out noise spikes).")
+    with col5:
         ema_span = st.number_input("EMA Smoothing Span", min_value=1, max_value=20, value=1, step=1,
                                    help=" 1 = no smoothing. 4 = moderate smoothing.")
 
@@ -1734,53 +1747,41 @@ def page_live_simulation(active_df, base_df, priority_dict, outlier_factor, outl
 
     if st.button("🚀 Start Fleet Simulation", type="primary", use_container_width=True):
         
-        # --- REMNANT FIX 1: Fetch channels from active_df ---
         channels = get_available_channels(active_df)
         results_list = []
 
         st.markdown("#### Simulation Progress")
         status_text = st.empty()
         progress_bar = st.progress(0.0)
-        sub_status_text = st.empty()
-        sub_progress_bar = st.progress(0.0)
-
+        
         total_channels = len(channels)
-        UI_THROTTLE = 5  
 
         if break_algo == "Fleet Z-Score":
             status_text.markdown("**Pre-computing Fleet Baseline...**")
-            # --- REMNANT FIX 2: Anchor Z-Score strictly to base_df ---
             fleet_mean, fleet_std = compute_fleet_baseline(base_df, outlier_factor, outlier_window)
         else:
             fleet_mean, fleet_std = 0.0, 1.0
             
         origin_date = active_df.index.min().normalize()
-        
         available_cores = os.cpu_count() or 1
-        
         core_info_box = st.empty()
-        
-        # 2. Write the message INSIDE the placeholder
         core_info_box.info(f"⚡Multi-Core processing active. Utilizing **{available_cores} CPU cores**.")
-
         status_text.markdown(f"**Spinning up {available_cores} CPU cores...**")
 
-        # --- THE MULTI-CORE DISPATCHER ---
-        # max_workers=None defaults to the number of physical cores on your machine
         with concurrent.futures.ProcessPoolExecutor() as executor:
-            
-            # 1. Dispatch all jobs to the background cores
             futures = []
             for channel in channels:
                 future = executor.submit(
                     process_single_channel_worker, 
                     channel, active_df, outlier_factor, outlier_window, 
-                    target_thresh, break_algo, break_window, break_step, 
+                    target_thresh, crossing_sustained, # <--- NEW PARAMETER PASSED HERE
+                    break_algo, break_window, break_step, 
                     break_sustained, z_factor, z_sustained, min_mse_floor, 
                     req_break, step_days, window_size, eval_window, 
                     override_model, manual_model, use_dynamic_variance, 
-                    variance_window, priority_dict, ema_span, origin_date,fit_freq,
-                    fleet_mean, fleet_std,
+                    variance_window, priority_dict, ema_span, origin_date,
+                    fit_freq,
+                    fleet_mean, fleet_std
                 )
                 futures.append(future)
 
@@ -2544,7 +2545,7 @@ def main():
         if break_algo == "Fleet Z-Score":
             fleet_mean, fleet_std = compute_fleet_baseline(base_df, outlier_factor, outlier_window)
             break_idx, break_time, _eval_start_idx = detect_zscore_break(
-                time_arr, sensor_arr_smooth, fleet_mean, fleet_std, z_factor, z_sustained, min_mse_floor=min_mse_floor
+                time_arr, sensor_arr_smooth, fleet_mean, fleet_std, z_factor, z_sustained
             )
         else:
             break_idx, break_time, _eval_start_idx = detect_structural_break(
